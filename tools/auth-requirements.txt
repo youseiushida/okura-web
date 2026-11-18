@@ -1,10 +1,18 @@
 # パスキー（webauthn）の仮想環境（.work/venvs/auth）。Web のサーバーは import しない（okura_web/bridge/passkey.py をサブプロセスで動かす）。
 # 2026-11-17 に安全性を確かめた版とハッシュ（.work/scratch/dep-vetting.md）。cbor2 6.3.0 未満・pyasn1 0.6.4 以下は使わない（サーバーを落とせる穴）。
 # 入れ方：uv pip install --python .work/venvs/auth/Scripts/python.exe --require-hashes --only-binary :all: --no-deps -r tools/auth-requirements.txt
+# cbor2・cryptography・cffi は OS ごとに wheel が違う。1つ目のハッシュが Windows（win_amd64）、続く2つが Linux（x86_64・aarch64）。
+# Linux の分は 2026-11-18 に PyPI の同じ版のファイルのハッシュを足した（cp311 の manylinux。版は変えていない）。
 webauthn==3.0.1     --hash=sha256:9927b2f530773bd1d7f8194cd643a2e634a20995ea31f2d8f7a3e70b11c93e31
-cbor2==6.3.0     --hash=sha256:d34621f0edc236e741fdc33846a212e1480b4b1b3a93fba108e6bd0b1e6b0827
-cryptography==50.0.2     --hash=sha256:7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c
-cffi==2.1.1     --hash=sha256:42f6930c31dc7f50732c9ae793c2786c7b6b044195967bbdde40bb9be81c4cc0
+cbor2==6.3.0     --hash=sha256:d34621f0edc236e741fdc33846a212e1480b4b1b3a93fba108e6bd0b1e6b0827 \
+    --hash=sha256:ebe634e9fe6ae36b3fe1c42d280c4ecb368397efbcd497f8d5826d48e9093f1b \
+    --hash=sha256:9253098c278540523cc27b9bedaf7d1d1655d2961b2ae1e6e43fc6592240016b
+cryptography==50.0.2     --hash=sha256:7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c \
+    --hash=sha256:9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079 \
+    --hash=sha256:87e9ce85beb6b328ba370cc6e6aea483c92617b4c95b1d33a49297eb662bfb04
+cffi==2.1.1     --hash=sha256:42f6930c31dc7f50732c9ae793c2786c7b6b044195967bbdde40bb9be81c4cc0 \
+    --hash=sha256:34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632 \
+    --hash=sha256:3311ed60d36f83378794e1009ac6258bafbf81f7888b4caa7b35a521e3f95813
 pycparser==3.12     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e
 pyopenssl==26.4.0     --hash=sha256:f0eb0cb2d581d3ad2b9c489468485e7f2ab6727d08401bcf9d824c3caddf3c1c
 pyasn1==0.6.5     --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587
