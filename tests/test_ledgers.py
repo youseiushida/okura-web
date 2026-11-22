@@ -140,7 +140,7 @@ class EvidenceTest(LedgerTestBase):
 
     def test_verify_detects_tampering(self) -> None:
         sha, path = self.lg.store_evidence(self.DATA, "pdf")
-        os.chmod(path, stat.S_IWRITE)
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)  # Linux では S_IWRITE だけだと読めなくなる（0200）
         path.write_bytes(b"tampered")
         self.assertFalse(self.lg.verify_evidence(sha, "pdf"))
         self.assertFalse(self.lg.verify_evidence("0" * 64, "pdf"))
