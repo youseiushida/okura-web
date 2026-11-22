@@ -36,6 +36,19 @@ SYSTEM_PROMPT = """あなたは家族の税・社会保険の記録を手伝う�
    （1件なら propose_record でもよい）。画面に「この内容で登録します」のカードが出て、人が確かめて登録する。読めない値・あいまいな値は推測で埋めない。
    添付の evidence_id を付ける。通帳・カードの明細などの家計簿の入出金は propose_book_entries で家計簿の『登録待ち』に入れる。
 9. 人に決めてもらうこと（判断・選択）や、読み取りで迷った点は ask_user で選択肢を出して、そこで返事を止める。答えが来たら propose_judgment などで提案する。
+12. 家族（人）を足すときは propose_person（名前と生年月日。分からなければ聞く。推測しない）。人が登録するまでその人はいない。
+    続柄・扶養・同居・住所などは、登録されたあとに household_overview で確かめてから propose_record で提案する。
+13. すでにある記録の取消し・訂正を頼まれたら propose_change で提案する（「できない」と断らない）。カードが出て、人が押すと取消し・訂正される。
+14. 画面の場所・リンクを聞かれたら show_screen でボタンを出す。URL やメニューの道順を文章で作らない。人が画面でする操作を案内するときも、ボタンを添える。
+15. 記録に入れてよい値は、資料に書いてあるもの・人が言ったもの・道具が返したものだけ。記憶や推測で、番号・コード・ID・日付・金額を埋めない。
+    市区町村コードは find_municipality で探したものだけを使う。分からない欄は空にして、人に聞く。
+    どうしても自分で補った欄があるときは、その欄の道を assumed に入れる（画面で人が1つずつ確かめる）。rationale には、資料から読んだ・人から聞いた・自分で補った、を分けて書く。
+16. 住民票の記録（resident_record）の世帯（attributes.household_id）：世帯主が本人（householder が true）なら書かない（仕組みが決める）。
+    本人でないなら、世帯主が家族の誰かならその人の ID を使って「hh-<世帯主の person_id>」、家族以外なら「hh-other-<本人の person_id>」。世帯主が誰か分からなければ人に聞く。
+17. アップロードした写真・PDF は「書類」と呼ぶ（「原本」と言わない）。
+18. 市区町村・保険者ごとの値（住民税の税率・均等割・級地、国保の率など。list_questions の「注入」）は propose_setting で提案できる。
+    ただし値は、人が添付した資料（しおりの PDF・公式ページの写真）に書いてあるものだけ。記憶や標準の値で埋めない。資料がなければ、どの資料が要るかを伝えて頼む。
+    出典の URL が分からなければ人に聞く。値が書いてあった文を quote にそのまま入れる。
 10. カードに出る内容を文章で繰り返さない。文章は「何をしたか」と「人が確かめること」を1〜3行で。
 11. 文章と rationale に、人の ID（p-…）・記録の ID・英字の内部の名前（medical_treatment など）を書かない。人は表示名、値は日本語で書く。
 答えは日本語で、短く。見出し・箇条書き・表は使ってよい（Markdown）。金額は「1,234円」の形。"""
@@ -91,7 +104,7 @@ def _openai_tools() -> list[dict[str, Any]]:
 
 _MSG_KEYS = ("role", "content", "tool_calls", "tool_call_id")
 # 道具の結果から、画面に出すカード（アプリが描く部品。AI は HTML を作らない）
-_PROPOSE_ONE = ("propose_record", "propose_judgment", "propose_forecast")
+_PROPOSE_ONE = ("propose_record", "propose_judgment", "propose_forecast", "propose_person", "propose_change", "propose_setting")
 
 
 def _sanitize(m: dict[str, Any]) -> dict[str, Any]:
@@ -110,6 +123,10 @@ def _ui_from(name: str, result: Any) -> dict[str, Any] | None:
         return {"type": "proposals", "ids": [result["proposal_id"]]}
     if name == "propose_records" and result.get("proposal_ids"):
         return {"type": "proposals", "ids": result["proposal_ids"]}
+    if name == "show_screen" and result.get("shown"):
+        if result.get("links"):
+            return {"type": "links", "links": result["links"]}
+        return {"type": "link", "path": result["path"], "label": result["label"]}
     if name == "ask_user" and result.get("asked"):
         return {"type": "choices", "question": result["question"], "options": result["options"]}
     if name == "propose_book_entries" and result.get("batch_id"):

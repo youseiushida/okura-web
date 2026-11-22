@@ -113,7 +113,7 @@ http://127.0.0.1:8765/ を開くと、最初の設定（世帯・あなたのア
 - このパソコンからは stdio の `mcp_server.py` も使える。
 - HTTP：`GET /api/v1/tools`、`POST /api/v1/tools/<名前>`（`Authorization: Bearer okt_…`）、`GET /api/v1/openapi.json`。
 - 道具：household_overview・list_records・get_record・vocabulary・list_proposals（読む）、run_calculation・calculation_status（計算する）、
-  calculation_summary・explain_value・list_questions・list_out_of_scope・list_boundaries・form_fields（説明する）、propose_record・propose_judgment・propose_forecast（提案する）。
+  calculation_summary・explain_value・list_questions・list_out_of_scope・list_boundaries・form_fields（説明する）、propose_record・propose_judgment・propose_forecast・propose_person（家族の追加）・propose_change（記録の取消し・訂正）・find_municipality（市区町村コードを一覧から探す）・add_document（書類を保存する。記録は作らない。大きいファイルは POST /mcp/documents にそのまま送る）・setting_points と propose_setting（市区町村・保険者ごとの値を、出典つきで提案）（提案する）。
 - 接続先の手順とアイコンの元：`tools/mcp_clients.source.json` → `tools/build_mcp_clients.py` → `frontend/src/lib/mcp_clients.js`（アイコンはパスと色だけに絞って検査する）。
 
 ## 9. アプリ内の AI（⑤）

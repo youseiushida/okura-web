@@ -200,7 +200,7 @@ def _attachment_parts(req: Request, hid: str, ids: list[str], msg: str, external
     for eid in ids:
         row = api._evidence_row(hid, eid)
         if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-            raise HttpError(403, "見られない原本は送れない", code="forbidden")
+            raise HttpError(403, "見られない書類は送れない", code="forbidden")
         if external and not acc.external_ok(row["owner_person"]):
             raise HttpError(403, "この添付の持ち主が「外部の AI」に同意していないので、外部の AI に送れない（設定 → 共有設定）", code="no_external_consent")
         data = _app().ledger(hid).evidence_path(row["sha256"], row["ext"]).read_bytes()
@@ -300,12 +300,12 @@ def evidence_extract(req: Request) -> Any:
     acc = api._access(req)
     row = api._evidence_row(hid, req.params["eid"])
     if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-        raise HttpError(403, "見えない原本は読み取れない", code="forbidden")
+        raise HttpError(403, "見えない書類は読み取れない", code="forbidden")
     cfg = llm_config(_app(), hid)
     b = req.json()
     if cfg.get("external"):
         if not acc.external_ok(row["owner_person"]):
-            raise HttpError(403, "この原本の持ち主が外部の AI に渡す同意をしていない", code="no_external_consent")
+            raise HttpError(403, "この書類の持ち主が外部の AI に渡す同意をしていない", code="no_external_consent")
         if not b.get("acknowledge_external"):
             raise HttpError(400, "この写真を外部の LLM API に送る。確かめて同意する", code="ack_required")
     data = _app().ledger(hid).evidence_path(row["sha256"], row["ext"]).read_bytes()

@@ -249,10 +249,16 @@ def household(req: Request) -> Any:
 @router.route("POST", "/api/persons")
 def add_person(req: Request) -> Any:
     _human(req)
-    hid = _hh(req)
     b = req.json()
-    name = _check_name(b.get("display_name"), "表示名")
-    birth = _check_date(b.get("birth_on"), "生年月日")
+    return create_person(req, b.get("display_name"), b.get("birth_on"))
+
+
+def create_person(req: Request, display_name: Any, birth_on: Any) -> dict[str, Any]:
+    """家族（人）を足す。人のセッションからだけ呼ぶ（画面の「家族を追加」と、AI の提案を人が確かめて登録するとき）。"""
+    _human(req)
+    hid = _hh(req)
+    name = _check_name(display_name, "表示名")
+    birth = _check_date(birth_on, "生年月日")
     pid = dbm.new_id("p", 4)
     p = req.principal
     assert p is not None and p.person_id
@@ -461,13 +467,23 @@ def upload_evidence(req: Request) -> Any:
     _human(req)
     hid = _hh(req)
     acc = _access(req)
-    owner = req.arg("owner") or acc.me
+    assert req.principal is not None
+    out = store_document(hid, acc, req.principal.user_id, req.arg("owner") or acc.me, req.body(APP.cfg.max_upload_bytes), req.arg("name") or "", req.arg("label"))
+    if not out["duplicate"]:
+        _audit(req, "evidence_uploaded", out["id"])
+    return out
+
+
+def store_document(hid: str, acc: Access, user_id: str, owner: Any, data: bytes, name: str, label: Any) -> dict[str, Any]:
+    """書類（写真・PDF・表）を保存する。画面のアップロードと、エージェント（MCP）からの追加の両方が通る。
+    保存するだけで、記録は作らない（記録は、人が画面で確かめて登録したときにできる）。同じ中身の書類は二重に置かない。"""
     if owner not in acc.all_persons:
         raise HttpError(400, "持ち主の人がいない", code="bad_person")
-    data = req.body(APP.cfg.max_upload_bytes)
     if not data:
         raise HttpError(400, "中身が空", code="empty")
-    kind = sniff(data) or sniff_table(data, req.arg("name") or "")
+    if len(data) > APP.cfg.max_upload_bytes:
+        raise HttpError(413, "書類が大きすぎる", code="too_large")
+    kind = sniff(data) or sniff_table(data, name or "")
     if kind is None:
         raise HttpError(415, "画像（JPEG・PNG・WebP・HEIC・GIF）・PDF・Excel（.xlsx）・CSV・テキストだけを受け付ける", code="unsupported_type")
     ext, mime = kind
@@ -477,16 +493,13 @@ def upload_evidence(req: Request) -> Any:
     if existing:
         return {"ok": True, "id": existing["id"], "sha256": sha, "duplicate": True}
     eid = dbm.new_id("ev", 6)
-    label = req.arg("label")
     if label:
         label = _check_name(label, "ラベル", 100)
-    assert req.principal is not None
     with APP.db.tx() as c:
         c.execute(
             "INSERT INTO evidence(id, household_id, sha256, ext, mime, size, owner_person, uploaded_by, uploaded_at, label) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (eid, hid, sha, ext, mime, len(data), owner, req.principal.user_id, dbm.now_iso(), label),
+            (eid, hid, sha, ext, mime, len(data), owner, user_id, dbm.now_iso(), label or None),
         )
-    _audit(req, "evidence_uploaded", eid)
     return {"ok": True, "id": eid, "sha256": sha, "duplicate": False}
 
 
@@ -512,7 +525,7 @@ def get_evidence(req: Request) -> Any:
     acc = _access(req)
     row = _evidence_row(hid, req.params["eid"])
     if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-        raise HttpError(403, "この原本は本人の同意がないので見られない", code="forbidden")
+        raise HttpError(403, "この書類は本人の同意がないので見られない", code="forbidden")
     intact = APP.ledger(hid).verify_evidence(row["sha256"], row["ext"])
     return {**row, "records": _links(hid).get(row["id"], []), "intact": intact}
 
@@ -523,7 +536,7 @@ def evidence_file(req: Request) -> Any:
     acc = _access(req)
     row = _evidence_row(hid, req.params["eid"])
     if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-        raise HttpError(403, "この原本は本人の同意がないので見られない", code="forbidden")
+        raise HttpError(403, "この書類は本人の同意がないので見られない", code="forbidden")
     path = APP.ledger(hid).evidence_path(row["sha256"], row["ext"])
     csp = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'"
     if row["mime"] != "application/pdf":
@@ -544,7 +557,7 @@ def evidence_meta(req: Request) -> Any:
     acc = _access(req)
     row = _evidence_row(hid, req.params["eid"])
     if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-        raise HttpError(403, "見えない原本", code="forbidden")
+        raise HttpError(403, "見えない書類", code="forbidden")
     b = req.json()
     sets, args = [], []
     if "doc_type" in b:
@@ -682,11 +695,14 @@ def _prepare_record(hid: str, acc: Access, section: str, rec: dict[str, Any], ev
     rec = json.loads(json.dumps(rec))
     rec.setdefault("id", dbm.new_id(SECTION_PREFIX[section], 6))
     rec.pop("recorded_at", None)
+    probs = guard_record(rec, set(acc.all_persons))
+    if probs:
+        raise HttpError(400, " / ".join(probs), code="bad_record")
     shas = []
     for eid in evidence_ids:
         row = _evidence_row(hid, eid)
         if not acc.sees_original(row["owner_person"], row["uploaded_by"]):
-            raise HttpError(403, "見られない原本は結びつけられない", code="forbidden")
+            raise HttpError(403, "見られない書類は結びつけられない", code="forbidden")
         shas.append(row["sha256"])
     if shas:
         src = dict(rec.get("source") or {})
@@ -705,12 +721,77 @@ def _link_evidence(hid: str, user_id: str, evidence_ids: list[str], record_id: s
             )
 
 
-def write_record(req: Request, section: str, rec: dict[str, Any], evidence_ids: list[str]) -> dict[str, Any]:
+def household_label(hh: Any, names: dict[str, str]) -> str | None:
+    """世帯の ID を画面の言葉に（ID は画面に出さない）。"""
+    if not isinstance(hh, str) or not hh.startswith("hh-"):
+        return None
+    rest = hh[3:]
+    if rest.startswith("other-"):
+        return "家族以外の人が世帯主の世帯"
+    return f"{names[rest]}さんが世帯主の世帯" if rest in names else None
+
+
+def guard_record(rec: dict[str, Any], persons: set[str]) -> list[str]:
+    """記録の中の「作り話になりやすい値」を確かめる（人の入力・AI の提案の両方）。問題の文の一覧（空なら通った）。
+
+    - 市区町村コード：総務省の一覧にあるものだけ（記憶で入れた番号を通さない）
+    - 住民票の世帯：世帯主が本人ならその人の世帯。本人でなければ、世帯主（家族の誰か・家族以外）から決まる形だけ。
+      世帯主が本人のときは、ここで世帯を決める（渡された値は使わない）
+    """
+    from . import municipal
+
+    probs: list[str] = []
+    attrs = rec.get("attributes")
+    if not isinstance(attrs, dict):
+        return probs
+    for k, v in attrs.items():
+        if k.endswith("municipality_code") and v is not None and municipal.name_of(v) is None:
+            city = municipal.city_of_ward(v)
+            probs.append(f"政令指定都市の区のコードは使わない。その市のコード（{city}・{municipal.name_of(city)}）を使う" if city
+                         else "市区町村コードが総務省の一覧にない（名前から探して選ぶ）")
+        if k.endswith("municipality_codes") and isinstance(v, list) and any(municipal.name_of(x) is None for x in v):
+            probs.append("市区町村コードが総務省の一覧にない（名前から探して選ぶ）")
+    if rec.get("kind") == "resident_record" and "householder" in attrs:
+        who = (rec.get("roles") or {}).get("person")
+        if attrs.get("householder") is True:
+            if isinstance(who, str):
+                attrs["household_id"] = f"hh-{who}"
+        else:
+            hh = attrs.get("household_id")
+            ok = isinstance(hh, str) and (hh == f"hh-other-{who}" or (hh.startswith("hh-") and hh[3:] in persons and hh[3:] != who))
+            if not ok:
+                probs.append("世帯主が本人でないときは、世帯主が誰か（家族の誰か、または家族以外）が要る")
+    return probs
+
+
+def _one_line(text: Any, default: str) -> str:
+    """理由の文を1行・200文字までにする（提案の理由には改行が入ることがある）。"""
+    s = " ".join(str(text or "").split())[:200]
+    return s or default
+
+
+def _same_content(rec: dict[str, Any]) -> str:
+    """記録の中身（ID・記録した時刻・出どころを除く）。同じ内容かどうかを比べる。"""
+    return json.dumps({k: v for k, v in rec.items() if k not in ("id", "recorded_at", "source")}, ensure_ascii=False, sort_keys=True)
+
+
+def find_duplicate(hid: str, section: str, rec: dict[str, Any]) -> str | None:
+    """同じ内容の（取り消していない）記録があれば、その ID。二度押し・二重の取り込みで同じ記録が2件入るのを止める。"""
+    want = _same_content(rec)
+    for rid, head in APP.ledger(hid).heads("facts").items():
+        if head["op"] != "delete" and head.get("section") == section and _same_content(head.get("record") or {}) == want:
+            return rid
+    return None
+
+
+def write_record(req: Request, section: str, rec: dict[str, Any], evidence_ids: list[str], *, allow_duplicate: bool = False) -> dict[str, Any]:
     """人が確定した記録を事実台帳に書く（写しで中間表現の検査まで通してから）。"""
     _human(req)
     hid = _hh(req)
     acc = _access(req)
     rec = _prepare_record(hid, acc, section, rec, evidence_ids)
+    if not allow_duplicate and find_duplicate(hid, section, rec):
+        raise HttpError(409, "同じ内容の記録がすでにある", code="duplicate_record")
     p = req.principal
     assert p is not None and p.person_id
     try:
@@ -725,7 +806,7 @@ def write_record(req: Request, section: str, rec: dict[str, Any], evidence_ids: 
 @router.route("POST", "/api/records")
 def add_record(req: Request) -> Any:
     b = req.json()
-    return write_record(req, str(b.get("section", "")), b.get("record") or {}, list(b.get("evidence_ids") or []))
+    return write_record(req, str(b.get("section", "")), b.get("record") or {}, list(b.get("evidence_ids") or []), allow_duplicate=bool(b.get("allow_duplicate")))
 
 
 def _record_section(hid: str, rid: str) -> tuple[str, dict[str, Any]]:
@@ -737,19 +818,23 @@ def _record_section(hid: str, rid: str) -> tuple[str, dict[str, Any]]:
 
 @router.route("POST", "/api/records/{rid}/correct")
 def correct_record(req: Request) -> Any:
+    b = req.json()
+    return change_record(req, req.params["rid"], b.get("record") or {}, b.get("reason"), list(b.get("evidence_ids") or []))
+
+
+def change_record(req: Request, rid: str, rec: dict[str, Any], reason_in: Any, evidence_ids: list[str]) -> dict[str, Any]:
+    """記録を訂正する（追記）。人のセッションからだけ。"""
     _human(req)
     hid = _hh(req)
     acc = _access(req)
-    rid = req.params["rid"]
-    b = req.json()
     section, old = _record_section(hid, rid)
     known = set(acc.all_persons)
     if not acc.sees_details_of(persons_in(old, known), _recorders(hid).get(rid)):
         raise HttpError(403, "見えない記録は直せない", code="forbidden")
-    reason = _check_name(b.get("reason"), "訂正の理由", 200)
-    rec = b.get("record") or {}
+    reason = _check_name(reason_in, "訂正の理由", 200)
+    rec = dict(rec)
     rec["id"] = rid
-    rec = _prepare_record(hid, acc, section, rec, list(b.get("evidence_ids") or []))
+    rec = _prepare_record(hid, acc, section, rec, evidence_ids)
     if old.get("source") and "source" not in rec:
         rec["source"] = old["source"]
     p = req.principal
@@ -758,23 +843,27 @@ def correct_record(req: Request) -> Any:
         APP.ledger(hid).write("facts", [{"op": "correct", "section": section, "record_id": rid, "record": rec, "reason": reason}], recorded_by_person=p.person_id)
     except EngineError as e:
         raise _engine_error(e) from e
-    _link_evidence(hid, p.user_id, list(b.get("evidence_ids") or []), rid)
+    _link_evidence(hid, p.user_id, evidence_ids, rid)
     _audit(req, "record_corrected", rid)
     return {"ok": True, "record_id": rid, "job_id": _recalc(hid, p.user_id)}
 
 
 @router.route("POST", "/api/records/{rid}/delete")
 def delete_record(req: Request) -> Any:
+    return remove_record(req, req.params["rid"], req.json().get("reason"))
+
+
+def remove_record(req: Request, rid: str, reason_in: Any) -> dict[str, Any]:
+    """記録を取り消す（消さずに、取消しと理由を追記する）。人のセッションからだけ。"""
     _human(req)
     hid = _hh(req)
     acc = _access(req)
-    rid = req.params["rid"]
     section, old = _record_section(hid, rid)
     if section == "persons":
         raise HttpError(400, "人の記録は取り消せない（生年月日の訂正はできる）", code="bad_section")
     if not acc.sees_details_of(persons_in(old, set(acc.all_persons)), _recorders(hid).get(rid)):
         raise HttpError(403, "見えない記録は取り消せない", code="forbidden")
-    reason = _check_name(req.json().get("reason"), "取消しの理由", 200)
+    reason = _check_name(reason_in, "取消しの理由", 200)
     p = req.principal
     assert p is not None and p.person_id
     try:
@@ -874,6 +963,10 @@ def create_proposal(hid: str, *, kind: str, payload: dict[str, Any], rationale: 
 
 def proposal_visible(acc: Access, pr: dict[str, Any]) -> bool:
     payload = pr["payload"]
+    if pr.get("kind") == "injection":
+        return True  # 設定（市区町村・保険）の提案。公開の事実だけ（家族のデータは入らない）。入れられるのは管理者だけ
+    if pr.get("kind") == "person":
+        return True  # 家族の追加の提案（まだいない人の名前と生年月日だけ）。世帯の人は見て、確かめて登録できる
     ps = persons_in(payload.get("record") or {}, set(acc.all_persons))
     if pr.get("created_by") == f"user:{acc.principal.user_id}":
         return True
@@ -925,9 +1018,20 @@ def accept_proposal(req: Request) -> Any:
     section = payload.get("section")
     if pr["kind"] == "record":
         ev = [pr["evidence_id"]] if pr.get("evidence_id") else []
-        res = write_record(req, section, rec, ev)
+        res = write_record(req, section, rec, ev, allow_duplicate=bool(b.get("allow_duplicate")))
+    elif pr["kind"] == "delete":
+        # 取消しの提案：人が確かめて押したときに、取消しと理由を追記する
+        res = remove_record(req, payload.get("record_id"), _one_line(b.get("reason") or pr.get("rationale"), "提案を確かめて取り消した"))
+    elif pr["kind"] == "correct":
+        res = change_record(req, payload.get("record_id"), rec, _one_line(b.get("reason") or pr.get("rationale"), "提案を確かめて訂正した"), [])
     elif pr["kind"] in ("judgment", "choice", "forecast"):
         res = write_judgment(req, section, rec, b.get("basis_note") or pr.get("rationale"))
+    elif pr["kind"] == "injection":
+        # 設定（市区町村・保険）の提案。管理者が出典と見比べて押したときに入る（保存の前にもう一度確かめる）
+        res = create_injection(req, payload.get("entry") or {})
+    elif pr["kind"] == "person":
+        # 家族の追加の提案。名前と生年月日は、人が確かめた（直した）ものを使う
+        res = create_person(req, rec.get("display_name"), rec.get("birth_on"))
     else:
         raise HttpError(400, "知らない提案の種類", code="bad_kind")
     assert req.principal is not None
@@ -1213,18 +1317,37 @@ _URL = re.compile(r"^https?://[!-~]+$")
 def list_injections(req: Request) -> Any:
     hid = _hh(req)
     rows = APP.db.all("SELECT i.*, u.display_name AS by_name FROM injections i LEFT JOIN users u ON u.id=i.created_by WHERE household_id=? ORDER BY created_at DESC", (hid,))
-    return {"injections": [{**{k: r[k] for k in ("id", "created_at", "retired_at")}, "by": r["by_name"], "entry": json.loads(r["entry"])} for r in rows]}
+    from . import municipal
+
+    out = []
+    for r in rows:
+        entry = json.loads(r["entry"])
+        iss = entry.get("issuer") or {}
+        # 団体のコードは画面に出さず、名前で出す（一覧で分かるもの）
+        out.append({**{k: r[k] for k in ("id", "created_at", "retired_at")}, "by": r["by_name"], "entry": entry, "issuer_label": municipal.issuer_label(iss.get("kind"), iss.get("code"))})
+    return {"injections": out}
 
 
 @router.route("POST", "/api/injections")
 def add_injection(req: Request) -> Any:
-    _admin(req)
-    hid = _hh(req)
-    b = req.json()
+    return create_injection(req, req.json())
+
+
+def injection_entry(hid: str, b: dict[str, Any]) -> dict[str, Any]:
+    """設定（市区町村・保険）の1件を作って確かめる（まだ保存しない）。出典の URL・団体（一覧にあるか）・判定コアの約束。
+    人の入力でも、AI の提案でも、同じ確かめを通す。"""
     src = b.get("source") or {}
     if not isinstance(src.get("url"), str) or not _URL.match(src["url"]):
         raise HttpError(400, "出典の URL（http・https）が要る", code="source_required")
     _check_date(src.get("retrieved_on"), "取得日")
+    from . import municipal
+
+    iss = b.get("issuer") if isinstance(b.get("issuer"), dict) else {}
+    if iss.get("kind") == "municipality" and municipal.name_of(iss.get("code")) is None:
+        city = municipal.city_of_ward(iss.get("code"))
+        raise HttpError(400, f"政令指定都市の区ではなく、その市（{municipal.name_of(city)}）で入れる" if city else "市区町村が総務省の一覧にない（候補から選ぶ）", code="bad_issuer")
+    if iss.get("kind") == "prefecture" and municipal.prefecture_name(iss.get("code")) is None:
+        raise HttpError(400, "都道府県が一覧にない（候補から選ぶ）", code="bad_issuer")
     entry = {
         "id": dbm.new_id("inj", 6),
         "point": b.get("point"),
@@ -1240,6 +1363,14 @@ def add_injection(req: Request) -> Any:
         raise _engine_error(e) from e
     if problems:
         raise HttpError(422, "注入データの形が判定コアの約束に合わない", code="injection_invalid", detail=problems)
+    return entry
+
+
+def create_injection(req: Request, b: dict[str, Any]) -> dict[str, Any]:
+    """設定（市区町村・保険）を足す。管理者のセッションからだけ（画面の入力と、AI の提案を管理者が確かめて押したとき）。"""
+    _admin(req)
+    hid = _hh(req)
+    entry = injection_entry(hid, b)
     assert req.principal is not None
     with APP.db.tx() as c:
         c.execute("INSERT INTO injections(id, household_id, entry, created_by, created_at) VALUES (?,?,?,?,?)", (entry["id"], hid, json.dumps(entry, ensure_ascii=False), req.principal.user_id, dbm.now_iso()))

@@ -23,7 +23,7 @@ from .auth import Principal
 CONSENT_KINDS = {
     "share_numbers": "計算に使う数字（所得・税額・判定の結果）を世帯の人に見せる",
     "share_details": "明細（給与・医療費などの記録の中身）を世帯の人に見せる",
-    "share_originals": "原本（アップロードした写真・PDF）を世帯の人に見せる",
+    "share_originals": "書類（アップロードした写真・PDF）を世帯の人に見せる",
     "external_ai": "外部の AI（外部の LLM API・外部のエージェント）に、伏せ字をしたうえで自分のデータを渡してよい",
 }
 

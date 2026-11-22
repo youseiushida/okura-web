@@ -7,9 +7,12 @@ import { yen } from '../lib/format';
 import { RecordForm, fieldsForRecord, fieldsForLedger, QUICK, type FormHandle } from '../lib/forms';
 import { fieldLabel, enumLabel, prettyValue } from '../lib/labels.js';
 import { refreshStatus } from '../lib/status';
+import { postChecked } from '../lib/writes';
 import { S, loadMeta, loadRecords, kindMeta, personName, formCtx } from '../lib/store';
 import { Icon } from '../ui/Icon';
 import { toast, errorToast, modal, openOverlay } from '../ui/overlay';
+import { isPersonProposal, personProposalLine, acceptPersonProposal, reviewPersonProposal } from './personProposal';
+import { isSettingProposal, settingTitle, settingLine, SettingBody, acceptSettingProposal } from './settingProposal';
 
 const ACCEPT = 'image/*,application/pdf,.pdf,.xlsx,.csv,.tsv,.txt';
 const TOOL_LABEL: Record<string, string> = {
@@ -45,6 +48,31 @@ function inline(text: string, kp: string | number = ''): ReactNode[] {
 
 const LIST_RE = /^\s*([-*・]|\d+[.)])\s+/;
 
+type ListRow = { indent: number; ordered: boolean; num: number; text: string; at: number };
+
+// 箇条書きの行 → 入れ子の <ol>・<ul>。字下げが深い行は、直前の項目の中に入れる。
+// 同じ深さで印の種類が変わったら、別の箇条書きにする（番号の付いた項目の下の「・」を、番号の続きにしない）
+function listTree(rows: ListRow[], key: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  let k = 0;
+  while (k < rows.length) {
+    const base = rows[k].indent;
+    const ordered = rows[k].ordered;
+    const first = rows[k].num; // 書いてある番号から始める（途中に「・」をはさんでも番号を戻さない）
+    const items: ReactNode[] = [];
+    while (k < rows.length && rows[k].indent <= base && rows[k].ordered === ordered) {
+      const row = rows[k];
+      k += 1;
+      const start = k;
+      while (k < rows.length && rows[k].indent > base) k += 1;
+      const kids = rows.slice(start, k);
+      items.push(<li key={row.at}>{inline(row.text)}{kids.length ? listTree(kids, `${key}-${row.at}`) : null}</li>);
+    }
+    out.push(ordered ? <ol key={`${key}-${out.length}`} start={first}>{items}</ol> : <ul key={`${key}-${out.length}`}>{items}</ul>);
+  }
+  return out;
+}
+
 export function Md({ src }: { src: string }) {
   const lines = String(src || '').replace(/\r/g, '').split('\n');
   const root: ReactNode[] = [];
@@ -77,13 +105,15 @@ export function Md({ src }: { src: string }) {
     const hm = /^(#{1,4})\s+(.*)$/.exec(ln);
     if (hm) { root.push(<div className={`md-h md-h${hm[1].length}`} key={key}>{inline(hm[2])}</div>); i += 1; continue; }
     if (LIST_RE.test(ln)) {
-      const ordered = /^\s*\d+[.)]/.test(ln);
-      const items: ReactNode[] = [];
+      // 続いている箇条書きの行を集めて、字下げと印（番号か・点か）で入れ子にする
+      const rows: ListRow[] = [];
       while (i < lines.length && LIST_RE.test(lines[i])) {
-        items.push(<li key={i}>{inline(lines[i].replace(LIST_RE, ''))}</li>);
+        const raw = lines[i].replace(/\t/g, '    ');
+        const nm = raw.match(/^\s*(\d+)[.)]/);
+        rows.push({ indent: raw.length - raw.trimStart().length, ordered: !!nm, num: nm ? Number(nm[1]) : 1, text: raw.replace(LIST_RE, ''), at: i });
         i += 1;
       }
-      root.push(ordered ? <ol key={key}>{items}</ol> : <ul key={key}>{items}</ul>);
+      root.push(...listTree(rows, `l${key}`));
       continue;
     }
     if (!ln.trim()) { i += 1; continue; }
@@ -132,16 +162,25 @@ function flatten(obj: any, prefix = ''): Array<[string, any]> {
 
 const WHEN: Record<string, string> = { 'when.on': '日付', 'when.from_on': 'いつから', 'when.to_on': 'いつまで', 'when.tax_year': '年分', 'when.fiscal_year': '年度' };
 
-function recordRows(rec: any): ReactNode[] {
+// display：コード・ID の欄を画面の言葉にしたもの（サーバーが一覧から作る）。assumed：AI が自分で補った欄
+function recordRows(rec: any, extras: { display?: Record<string, string>; assumed?: string[] } = {}): ReactNode[] {
+  const display = extras.display || {};
+  const assumed = new Set(extras.assumed || []);
   return flatten(rec).map(([path, v]) => {
-    const t = valueText(path, v);
+    // 世帯の ID・コードそのものは出さない（言葉にできたものだけ出す）
+    const t = display[path] || (path === 'attributes.household_id' ? null : valueText(path, v));
     if (t === null) return null;
-    const label = WHEN[path] || (path === 'value' ? '答え' : path === 'note' ? 'メモ' : fieldLabel(path.split('.').pop()));
-    return <div className="cr-row" key={path}><span className="cr-k">{label}</span><span className="cr-v">{t}</span></div>;
+    const label = WHEN[path] || (path === 'value' ? '答え' : path === 'note' ? 'メモ' : path === 'attributes.household_id' ? '世帯' : fieldLabel(path.split('.').pop()));
+    return (
+      <div className={`cr-row${assumed.has(path) ? ' assumed' : ''}`} key={path}><span className="cr-k">{label}</span>
+        <span className="cr-v">{t}{assumed.has(path) ? <span className="chip warn" style={{ marginLeft: '6px' }}>AI が補った値</span> : null}</span></div>
+    );
   }).filter(Boolean);
 }
 
 function summaryLine(pr: any): string {
+  if (isSettingProposal(pr)) return settingLine(pr);
+  if (isPersonProposal(pr)) return personProposalLine(pr);
   const r = (pr.payload || {}).record || {};
   const a = r.amounts || {};
   const amt = a.amount ?? a.gross ?? a.payment_amount;
@@ -151,34 +190,126 @@ function summaryLine(pr: any): string {
 }
 
 function titleOf(pr: any): string {
+  if (isSettingProposal(pr)) return settingTitle(pr);
+  if (isPersonProposal(pr)) return '家族を追加';
   const r = (pr.payload || {}).record || {};
   const km = kindMeta(r.kind);
-  return km ? km.title : '記録';
+  const t = km ? km.title : '記録';
+  return pr.kind === 'delete' ? `取消し：${t}` : pr.kind === 'correct' ? `訂正：${t}` : t;
 }
 
 // ------------------------------------------------------------------ カード
 // 画面で押した結果を会話に残す（AI は次の返事でそれを知る。LLM は呼ばない）
 async function note(text: string) { if (chat.id) { try { await post(`/api/agent/chats/${encodeURIComponent(chat.id)}/note`, { text }); } catch { /* 会話に残せなくても続ける */ } } }
 
+const assumedOf = (pr: any): string[] => (((pr && pr.payload) || {}).assumed || []) as string[];
+
 async function editAndAccept(pr: any): Promise<boolean> {
+  if (isPersonProposal(pr)) return reviewPersonProposal(pr);
   const rec = (pr.payload || {}).record || {};
   const km = kindMeta(rec.kind);
   if (!km) { toast('この種類は直せません', 'bad'); return false; }
   await loadRecords();
-  const isLedger = pr.kind !== 'record';
+  const isLedger = ['judgment', 'choice', 'forecast'].includes(pr.kind);
   const q = QUICK.find((x: any) => x.kind === rec.kind);
   const form = createRef<FormHandle>();
   const res = await modal(km.title,
-    <RecordForm ref={form} fields={isLedger ? fieldsForLedger(km) : fieldsForRecord(km)} initial={rec} main={q ? q.main : null} ctx={formCtx()} />,
+    <>
+      {assumedOf(pr).length ? <div className="note warn" style={{ marginBottom: '12px' }}>AI が自分で補った欄があります。印の付いた欄を確かめて、チェックを入れてください</div> : null}
+      <RecordForm ref={form} fields={isLedger ? fieldsForLedger(km) : fieldsForRecord(km)} initial={rec} main={q ? q.main : null} ctx={formCtx()} ai={new Set(assumedOf(pr))} />
+    </>,
     [{ label: 'やめる', value: false }, { label: '登録', kind: 'primary', run: async () => {
+      if (form.current!.unverified()) { toast(`確かめていない欄が${form.current!.unverified()}つあります`, 'bad'); return false; }
       const { value, errors } = form.current!.read();
       if (errors.length) { toast('入力エラーがあります', 'bad'); return false; }
       value.kind = km.kind;
       if (km.mark && !value.mark) value.mark = km.mark;
-      await post(`/api/proposals/${encodeURIComponent(pr.id)}/accept`, { record: value });
+      await postChecked(`/api/proposals/${encodeURIComponent(pr.id)}/accept`, { record: value });
       return true;
     } }]);
   return !!res;
+}
+
+const DONE: Record<string, string> = { delete: '取り消しました', correct: '訂正しました' };
+
+// 画面への入口（AI が選んだ行き先。道はサーバーが一覧から作る）
+function LinkCard({ block, close }: { block: any; close: () => void }) {
+  const path = String(block.path || '');
+  if (!path.startsWith('/') || path.startsWith('//')) return null;
+  return <div className="ui-slot"><Link className="btn ui-link" to={path} onClick={close}><Icon name="chevronRight" size={15} />{String(block.label || '画面を開く')}</Link></div>;
+}
+
+// 書類（会話の中に写真をそのまま出す・大きく見る・ダウンロード）。道はサーバーが作ったものだけ
+const safePath = (s: unknown): s is string => typeof s === 'string' && s.startsWith('/') && !s.startsWith('//');
+
+// 写真を画面いっぱいに出す。写真を押すと拡大（指で動かせる）、もう一度押すと戻る。まわりか ✕ で閉じる
+function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  const [zoom, setZoom] = useState(false);
+  useEffect(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    document.addEventListener('keydown', esc, true);
+    return () => document.removeEventListener('keydown', esc, true);
+  }, [onClose]);
+  return (
+    <div className="lightbox" role="dialog" aria-label="書類の画像" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className={`lb-scroll${zoom ? ' zoom' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+        <img src={src} alt="書類の画像" onClick={() => setZoom((z) => !z)} />
+      </div>
+      <button type="button" className="lb-close" onClick={onClose} aria-label="閉じる"><Icon name="x" size={22} /></button>
+      <a className="lb-dl" href={src} download aria-label="ダウンロード"><Icon name="download" size={20} /></a>
+    </div>
+  );
+}
+
+function DocItem({ l, close }: { l: any; close: () => void }) {
+  // 写真かどうかは、読み込めたかで決める（PDF などは読み込めないので、開くボタンだけになる）
+  const [shown, setShown] = useState(safePath(l.download) && l.image !== false);
+  const enlarge = () => { openOverlay((done) => <Lightbox src={l.download} onClose={() => done()} />); };
+  return (
+    <div className="chat-doc">
+      {shown ? <button type="button" className="chat-doc-img" onClick={enlarge} aria-label="大きく見る"><img src={l.download} alt="書類の画像" loading="lazy" onError={() => setShown(false)} /></button> : null}
+      <div className="row" style={{ gap: '8px', flexWrap: 'wrap' }}>
+        {shown ? <button type="button" className="btn ui-link" onClick={enlarge}><Icon name="zoomIn" size={15} />大きく見る</button>
+          : <Link className="btn ui-link" to={l.path} onClick={close}><Icon name="file" size={15} />{String(l.label || '書類を開く')}</Link>}
+        {safePath(l.download) ? <a className="btn ui-link" href={l.download} download><Icon name="download" size={15} />ダウンロード</a> : null}
+      </div>
+    </div>
+  );
+}
+
+function LinksCard({ block, close }: { block: any; close: () => void }) {
+  const links = (Array.isArray(block.links) ? block.links : []).filter((l: any) => safePath(l.path));
+  if (!links.length) return null;
+  return <div className="ui-slot">{links.map((l: any, i: number) => <DocItem key={i} l={l} close={close} />)}</div>;
+}
+
+// 設定（市区町村・保険者ごとの値）の提案。入るのは、管理者が出典と見比べて押したときだけ
+function SettingCard({ pr, onChange }: { pr: any; onChange: () => void }) {
+  const state = pr.status;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const accept = async () => {
+    setBusy(true);
+    setErr('');
+    try { await acceptSettingProposal(pr); toast('設定しました'); await note(`設定しました：${settingTitle(pr)} ${settingLine(pr)}`); onChange(); }
+    catch (e: any) { setBusy(false); setErr((e && e.message) || 'うまくいかなかった'); }
+  };
+  const reject = async () => { try { await post(`/api/proposals/${encodeURIComponent(pr.id)}/reject`, {}); await note(`やめました：${settingTitle(pr)}`); onChange(); } catch (e) { errorToast(e); } };
+  return (
+    <div className={`ui-card ${state}`}>
+      <div className="uc-head"><span className="uc-ico"><Icon name="building" size={16} /></span>
+        <div className="uc-title"><small>{state === 'pending' ? 'この値を設定します' : state === 'accepted' ? '設定しました' : 'やめました'}</small><b>{settingTitle(pr)}</b></div>
+        {state === 'accepted' ? <span className="chip ok"><Icon name="check" size={12} />設定済み</span> : state === 'rejected' ? <span className="chip">やめた</span> : <span className="chip unverified">AI</span>}</div>
+      <SettingBody pr={pr} />
+      {err ? <div className="uc-err"><Icon name="alert" size={14} /><div><b>このままでは設定できません</b><div>{err}</div></div></div> : null}
+      {state === 'pending' ? (
+        <div className="uc-foot">
+          <button type="button" className="btn ghost" onClick={reject}>やめる</button>
+          <button type="button" className="btn primary" disabled={busy} onClick={accept}><Icon name="check" size={15} />設定する</button>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 // 登録の確認（1件）。登録は人が押したときだけ
@@ -189,9 +320,10 @@ function ProposalCard({ pr, onChange }: { pr: any; onChange: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<{ items: string[]; message: string } | null>(null);
   const accept = async () => {
+    if (pr.kind !== 'delete' && assumedOf(pr).length) { edit(); return; } // 補った欄は、確かめてからでないと登録しない
     setBusy(true);
     setErr(null);
-    try { await post(`/api/proposals/${encodeURIComponent(pr.id)}/accept`, {}); toast('登録しました'); await note(`登録しました：${titleOf(pr)} ${summaryLine(pr)}`); refreshStatus(); onChange(); }
+    try { if (isPersonProposal(pr)) await acceptPersonProposal(pr); else await postChecked(`/api/proposals/${encodeURIComponent(pr.id)}/accept`, {}); toast(DONE[pr.kind] || '登録しました'); await note(`${DONE[pr.kind] || '登録しました'}：${titleOf(pr)} ${summaryLine(pr)}`); refreshStatus(); onChange(); }
     catch (e: any) {
       setBusy(false);
       const items: string[] = e instanceof ApiError && Array.isArray(e.detail) ? e.detail.slice(0, 5).map((d: any) => humanize(d.message || '')) : [];
@@ -202,11 +334,16 @@ function ProposalCard({ pr, onChange }: { pr: any; onChange: () => void }) {
   const edit = async () => { try { if (await editAndAccept(pr)) { toast('登録しました'); await note(`直して登録しました：${titleOf(pr)}`); refreshStatus(); onChange(); } } catch (e) { errorToast(e); } };
   return (
     <div className={`ui-card ${state}`}>
-      <div className="uc-head"><span className="uc-ico"><Icon name={pr.kind === 'record' ? 'file' : 'flag'} size={16} /></span>
-        <div className="uc-title"><small>{state === 'pending' ? 'この内容で登録します' : state === 'accepted' ? '登録しました' : 'やめました'}</small><b>{titleOf(pr)}</b></div>
-        {state === 'accepted' ? <span className="chip ok"><Icon name="check" size={12} />登録済み</span> : state === 'rejected' ? <span className="chip">やめた</span> : <span className="chip unverified">AI</span>}</div>
-      {ev ? <a className="uc-ev" href={`/api/evidence/${encodeURIComponent(ev)}/file`} target="_blank" rel="noopener"><Icon name="file" size={14} />原本</a> : null}
-      <div className="uc-body">{recordRows(rec)}</div>
+      <div className="uc-head"><span className="uc-ico"><Icon name={isPersonProposal(pr) ? 'users' : pr.kind === 'record' ? 'file' : 'flag'} size={16} /></span>
+        <div className="uc-title"><small>{state === 'pending' ? (pr.kind === 'delete' ? 'この記録を取り消します' : pr.kind === 'correct' ? 'この内容に直します' : 'この内容で登録します') : state === 'accepted' ? (DONE[pr.kind] || '登録しました') : 'やめました'}</small><b>{titleOf(pr)}</b></div>
+        {state === 'accepted' ? <span className="chip ok"><Icon name="check" size={12} />{pr.kind === 'delete' ? '取消し済み' : pr.kind === 'correct' ? '訂正済み' : '登録済み'}</span> : state === 'rejected' ? <span className="chip">やめた</span> : <span className="chip unverified">AI</span>}</div>
+      {ev ? <a className="uc-ev" href={`/api/evidence/${encodeURIComponent(ev)}/file`} target="_blank" rel="noopener"><Icon name="file" size={14} />書類</a> : null}
+      <div className="uc-body">{isPersonProposal(pr) ? (
+        <>
+          <div className="cr-row"><span className="cr-k">名前</span><span className="cr-v">{rec.display_name}</span></div>
+          <div className="cr-row"><span className="cr-k">生年月日</span><span className="cr-v">{rec.birth_on}</span></div>
+        </>
+      ) : recordRows(rec, pr.payload || {})}</div>
       {pr.rationale ? <div className="uc-why">{humanize(pr.rationale)}</div> : null}
       <div>{err ? (
         <div className="uc-err"><Icon name="alert" size={14} /><div><b>このままでは登録できません</b>
@@ -216,8 +353,8 @@ function ProposalCard({ pr, onChange }: { pr: any; onChange: () => void }) {
       {state === 'pending' ? (
         <div className="uc-foot">
           <button type="button" className="btn ghost" onClick={reject}>やめる</button>
-          <button type="button" className="btn" onClick={edit}>直す</button>
-          <button type="button" className="btn primary" disabled={busy} onClick={accept}><Icon name="check" size={15} />登録</button>
+          {pr.kind === 'delete' ? null : <button type="button" className="btn" onClick={edit}>直す</button>}
+          <button type="button" className={`btn ${pr.kind === 'delete' ? 'danger' : 'primary'}`} disabled={busy} onClick={accept}><Icon name="check" size={15} />{pr.kind === 'delete' ? '取り消す' : assumedOf(pr).length ? '確かめて登録' : pr.kind === 'correct' ? '訂正する' : '登録'}</button>
         </div>
       ) : null}
     </div>
@@ -227,10 +364,11 @@ function ProposalCard({ pr, onChange }: { pr: any; onChange: () => void }) {
 // まとめて登録の行を押したとき：モーダルの中で1件を見て直す（押したあとの状態を取り直して出す）
 function ProposalInModal({ first, onChange }: { first: any; onChange: () => Promise<void> }) {
   const [pr, setPr] = useState<any>(first);
-  return <div><ProposalCard pr={pr} onChange={async () => {
+  const changed = async () => {
     get(`/api/proposals/${encodeURIComponent(first.id)}`).then(setPr).catch(() => {});
     await onChange();
-  }} /></div>;
+  };
+  return <div>{isSettingProposal(pr) ? <SettingCard pr={pr} onChange={changed} /> : <ProposalCard pr={pr} onChange={changed} />}</div>;
 }
 
 function ProposalsCard({ ids }: { ids: string[] }) {
@@ -249,7 +387,7 @@ function ProposalsCard({ ids }: { ids: string[] }) {
 
   if (prs === null) return <div className="ui-slot"><div className="ui-card loading"><span className="spinner" /> 読み込み中</div></div>;
   if (!prs.length) return <div className="ui-slot" />;
-  if (prs.length === 1) return <div className="ui-slot"><ProposalCard pr={prs[0]} onChange={load} /></div>;
+  if (prs.length === 1) return <div className="ui-slot">{isSettingProposal(prs[0]) ? <SettingCard pr={prs[0]} onChange={load} /> : <ProposalCard pr={prs[0]} onChange={load} />}</div>;
   const pending = prs.filter((p) => p.status === 'pending');
   const openRow = async (p: any) => {
     await modal(titleOf(p), <ProposalInModal first={p} onChange={load} />, [{ label: '閉じる', value: true }]);
@@ -258,10 +396,15 @@ function ProposalsCard({ ids }: { ids: string[] }) {
   const acceptAll = async () => {
     setBusy(true);
     let n = 0;
+    let held = 0;
     for (const id of [...sel]) {
-      try { await post(`/api/proposals/${encodeURIComponent(id)}/accept`, {}); n += 1; } catch (err) { errorToast(err); }
+      // AI が補った欄のある記録は、まとめては登録しない（行を開いて確かめる）
+      const one = (prs || []).find((x) => x.id === id);
+      // 設定（出典と見比べるもの）も、まとめては入れない
+      if (assumedOf(one).length || isSettingProposal(one)) { held += 1; continue; }
+      try { await postChecked(`/api/proposals/${encodeURIComponent(id)}/accept`, {}); n += 1; } catch (err) { errorToast(err); }
     }
-    toast(`${n}件を登録しました`);
+    toast(held ? `${n}件を登録しました。${held}件は、行を開いて確かめてください` : `${n}件を登録しました`);
     await note(`${n}件を登録しました`);
     refreshStatus();
     await load();
@@ -497,7 +640,9 @@ function ChatShell({ scope, prefill, close }: { scope: any; prefill?: string; cl
               {texts.map((m, i) => <div className="msg-ai" key={`t${i}`}><Md src={humanize(m.content)} /></div>)}
               {ui.map((b, bi) => (b.type === 'proposals' ? <ProposalsCard key={`u${bi}`} ids={b.ids} />
                 : b.type === 'choices' ? <ChoicesCard key={`okura.choice.${c.id}.${ti}.${bi}`} block={b} storeKey={`okura.choice.${c.id}.${ti}.${bi}`} send={(o) => { doSend(o); }} />
-                  : b.type === 'book' ? <BookCard key={`u${bi}`} block={b} close={close} /> : null))}
+                  : b.type === 'book' ? <BookCard key={`u${bi}`} block={b} close={close} />
+                    : b.type === 'link' ? <LinkCard key={`u${bi}`} block={b} close={close} />
+                      : b.type === 'links' ? <LinksCard key={`u${bi}`} block={b} close={close} /> : null))}
             </Fragment>
           );
         })}

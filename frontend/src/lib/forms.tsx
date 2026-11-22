@@ -107,7 +107,9 @@ function setAt(obj: any, path: string, v: any) {
 // ------------------------------------------------------------------ 1つの欄
 // 市区町村を名前で選ぶ（総務省の団体コードの一覧。大きいので使うときに読む）
 let MUNI: string[][] | null = null;
-const muniReady = (): Promise<string[][]> => (MUNI ? Promise.resolve(MUNI) : import('./municipalities.js').then((m) => { MUNI = m.MUNICIPALITIES as string[][]; return MUNI; }));
+// 政令指定都市の区：[区のコード, 都道府県, 市と区の名前, その市のコード]。区の名前でも選べるが、登録するのは市のコード
+let WARDS: string[][] = [];
+const muniReady = (): Promise<string[][]> => (MUNI ? Promise.resolve(MUNI) : import('./municipalities.js').then((m) => { MUNI = m.MUNICIPALITIES as string[][]; WARDS = (m.WARDS || []) as string[][]; return MUNI; }));
 const muniText = (r: string[]) => `${r[1]} ${r[2]}`;
 
 /**
@@ -139,6 +141,9 @@ function MuniWidget({ init, id, ref }: WProps) {
       const t = text.trim().replace(/\s+/g, ' ');
       if (!t) return undefined;
       if (/^\d{6}$/.test(t)) return t;
+      const squeezed = t.replace(/ /g, '');
+      const ward = WARDS.filter((w) => `${w[1]}${w[2]}` === squeezed || w[2] === squeezed);
+      if (ward.length === 1) return ward[0][3];
       const list = MUNI || [];
       const hit = list.filter((r) => muniText(r) === t || `${r[1]}${r[2]}` === t.replace(/ /g, ''));
       const byName = hit.length ? hit : list.filter((r) => r[2] === t);
@@ -149,7 +154,11 @@ function MuniWidget({ init, id, ref }: WProps) {
   return (
     <div>
       <input type="search" id={id} list={listId} autoComplete="off" placeholder="例：練馬区" value={text} onChange={(e) => setText(e.target.value)} />
-      <datalist id={listId}>{(all || []).map((r) => <option key={r[0]} value={muniText(r)} />)}</datalist>
+      <datalist id={listId}>
+        {(all || []).map((r) => <option key={r[0]} value={muniText(r)} />)}
+        {all ? WARDS.map((w) => <option key={w[0]} value={`${w[1]} ${w[2]}`} />) : null}
+      </datalist>
+      {WARDS.some((w) => `${w[1]}${w[2]}` === text.replace(/\s/g, '') || w[2] === text.trim()) ? <div className="hint">政令指定都市の区は、その市として登録します（住民税を課すのは市のため）</div> : null}
     </div>
   );
 }
@@ -382,7 +391,9 @@ export function recordLabel(rec: any, ctx: any): string {
   const w = rec.when || {};
   const d = w.on || w.from_on || w.tax_year || w.fiscal_year || '';
   const desc = rec.attributes?.description || rec.attributes?.counterparty || rec.attributes?.name || '';
-  return `${name}${desc ? `：${desc}` : ''}${d ? `（${d}）` : ''}`;
+  // 選ぶときに見分けられるように、中身（説明・相手の名前）を先に出す。種類の名前の、かっこの中の説明は落とす
+  const short = String(name).replace(/[（(].*$/, '');
+  return `${desc || short}${desc ? `（${short}）` : ''}${d ? ` ${d}〜` : ''}`.trim();
 }
 
 // ------------------------------------------------------------------ 記録のフォーム
@@ -436,10 +447,16 @@ export function RecordForm({ fields, initial = {}, main = null, ctx, ai, sync, r
   const [errs, setErrs] = useState<Record<string, string>>({});
   const [verified, setVerified] = useState<Record<string, boolean>>({});
   const [open, setOpen] = useState(false);
+  const [head, setHead] = useState<string>(() => {
+    const hh = String(getAt(initial, 'attributes.household_id') || '');
+    if (getAt(initial, 'attributes.householder') !== false || !hh.startsWith('hh-')) return '';
+    return hh.startsWith('hh-other-') ? 'other' : hh.slice(3);
+  });
+  const [headErr, setHeadErr] = useState(false);
 
   const mainSet = main ? new Set(main) : new Set(fields.filter((f) => f.required).map((f) => f.path));
   const ordered = main ? [...main.map((p) => fields.find((f) => f.path === p)).filter((f): f is Field => !!f), ...fields.filter((f) => !mainSet.has(f.path))] : fields;
-  // 世帯は世帯主から決める（同じ世帯主の住民票の記録があればその世帯、なければ世帯主ごとに新しく）。画面には出さない
+  // 世帯の ID は画面に出さない。世帯主が本人ならその人の世帯、本人でなければ「世帯主は誰か」から決める（サーバーも同じ決まりで確かめる）
   const autoHousehold = fields.some((f) => f.path === 'attributes.household_id') && fields.some((f) => f.path === 'attributes.householder');
   const items = ordered.filter((f) => !(autoHousehold && f.path === 'attributes.household_id')).map((f) => {
     const type = typeOf(f.schema);
@@ -462,11 +479,17 @@ export function RecordForm({ fields, initial = {}, main = null, ctx, ai, sync, r
         setAt(value, it.f.path, v);
       }
       setErrs(marks);
-      if (autoHousehold && value.attributes && value.attributes.householder) {
-        const head = value.attributes.householder;
-        const prev = getAt(initial, 'attributes.household_id');
-        const same = (ctx.records || []).map((r: any) => r.record || r).find((r: any) => r.kind === 'resident_record' && r.attributes && r.attributes.householder === head && r.attributes.household_id);
-        value.attributes.household_id = prev && getAt(initial, 'attributes.householder') === head ? prev : same ? same.attributes.household_id : `hh-${head}`;
+      if (autoHousehold && value.attributes) {
+        const who = value.roles && value.roles.person;
+        let bad = false;
+        if (value.attributes.householder === true) {
+          if (who) value.attributes.household_id = `hh-${who}`;
+        } else if (value.attributes.householder === false) {
+          if (head === 'other' && who) value.attributes.household_id = `hh-other-${who}`;
+          else if (head && head !== who) value.attributes.household_id = `hh-${head}`;
+          else { bad = true; errors.push('attributes.household_id'); }
+        }
+        setHeadErr(bad);
       }
       for (const k of ['amounts', 'attributes', 'roles', 'when', 'subject']) if (value[k] && !Object.keys(value[k]).length) delete value[k];
       return { value, errors };
@@ -519,6 +542,18 @@ export function RecordForm({ fields, initial = {}, main = null, ctx, ai, sync, r
   return (
     <div className="form">
       <div className="form-cols">{mainItems.map(box)}</div>
+      {autoHousehold ? (
+        <div className={`field${headErr ? ' err' : ''}`}>
+          <label htmlFor={`${base}-head`}>世帯主が本人でないとき：世帯主は誰ですか</label>
+          <select id={`${base}-head`} className="in" value={head} onChange={(e) => { setHead(e.target.value); setHeadErr(false); }}>
+            <option value="">（本人が世帯主）</option>
+            {(ctx.persons || []).map((p: any) => <option key={p.person_id} value={p.person_id}>{p.display_name}</option>)}
+            <option value="other">ここにいない人（家族以外）</option>
+          </select>
+          <div className="hint">住民票の「世帯主」の欄の人です。同じ世帯かどうかは、ここで決まります</div>
+          <div className="err-msg">{headErr ? '世帯主が本人でないときは、世帯主を選んでください（本人以外）' : ''}</div>
+        </div>
+      ) : null}
       {moreItems.length ? (
         <details className="more" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
           <summary>{`詳細（${moreItems.length}）`}</summary>

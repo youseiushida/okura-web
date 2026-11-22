@@ -1,4 +1,5 @@
 // 記録（台帳）と家族
+import { postChecked } from '../lib/writes';
 import { Fragment, useEffect, useMemo, useRef, useState, type InputHTMLAttributes, type JSX, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
 import { get, post, ApiError } from '../lib/api';
@@ -45,7 +46,7 @@ function Thumb({ eid }: { eid: string }) {
   const [bad, setBad] = useState(false);
   return (
     <Link className="thumb" to={`/evidence/${eid}`}>
-      <div className="img">{bad ? 'PDF など' : <img src={`/api/evidence/${eid}/file`} alt="原本" onError={() => setBad(true)} />}</div>
+      <div className="img">{bad ? 'PDF など' : <img src={`/api/evidence/${eid}/file`} alt="書類" onError={() => setBad(true)} />}</div>
     </Link>
   );
 }
@@ -136,7 +137,7 @@ function RecordFormBody({ km, initial, after, opts, close }: { km: any; initial:
         if (!reason) return;
         await post(`/api/records/${encodeURIComponent(initial.id)}/correct`, { record: value, reason });
       } else {
-        saved = await post('/api/records', { section: km.section, record: value, evidence_ids: opts.evidence ? [opts.evidence] : [] });
+        saved = await postChecked('/api/records', { section: km.section, record: value, evidence_ids: opts.evidence ? [opts.evidence] : [] });
       }
       toast('保存しました');
       close();

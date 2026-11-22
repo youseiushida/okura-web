@@ -244,6 +244,11 @@ class Handler(BaseHTTPRequestHandler):
                 resp = self._mcp(app, method, parse_qs(parts.query))
                 self._send(resp)
                 return
+            if path == "/mcp/documents":
+                # エージェントが書類（写真・PDF）をそのまま送る入口。守りは /mcp と同じ（エージェントのトークン）
+                resp = self._mcp_document(app, method, parse_qs(parts.query))
+                self._send(resp)
+                return
             ok, why = self._access_ok()
             if not ok:
                 raise HttpError(403, f"Cloudflare Access で確認できませんでした（{why}）", code="access_denied")
@@ -291,6 +296,34 @@ class Handler(BaseHTTPRequestHandler):
         if out is None:
             return Response(status, b"", "text/plain; charset=utf-8")
         return Response.json(out, status)
+
+    def _mcp_document(self, app: App, method: str, query: dict[str, list[str]]) -> Response:
+        from .tools import ToolError, add_document_bytes, context_for
+
+        def fail(status: int, code: str, message: str, headers: dict[str, str] | None = None) -> Response:
+            r = Response.json({"ok": False, "error": {"code": code, "message": message}}, status)
+            r.headers.update(headers or {})
+            return r
+
+        if method != "POST":
+            return fail(405, "method", "POST だけを受け付ける", {"Allow": "POST"})
+        authz = self.headers.get("Authorization") or ""
+        token = authz[len("Bearer "):].strip() if authz.startswith("Bearer ") else ""
+        principal = app.auth.token(token) if token else None
+        if principal is None:
+            return fail(401, "unauthorized", "アクセストークンが要る（okura-web の 設定 → AI連携 で発行）", {"WWW-Authenticate": 'Bearer realm="okura-web"'})
+        n = int(self.headers.get("Content-Length") or "0")
+        if n <= 0 or n > app.cfg.max_upload_bytes:
+            return fail(413 if n > 0 else 400, "bad_size", "中身がない、または大きすぎる")
+        self.body_read = True
+        data = self.rfile.read(n)
+        one = lambda k: (query.get(k) or [""])[0]  # noqa: E731
+        try:
+            ctx = context_for(app, principal, external=principal.external, origin=f"mcp:{principal.token_id}")
+            out = add_document_bytes(ctx, data, one("name"), one("owner") or None, one("label") or None)
+        except ToolError as e:
+            return fail(400, "rejected", str(e))
+        return Response.json({"ok": True, "id": out["evidence_id"], "duplicate": out["duplicate"]})
 
     def _api(self, app: App, router: Router, method: str, path: str, query: dict[str, list[str]]) -> Response:
         found = router.match(method, path)
@@ -388,6 +421,16 @@ def web_build(web_dir: Path) -> str:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    # 同じポートで2つ目のサーバーが動かないようにする（Windows は SO_REUSEADDR だと2つ同時に待ち受けられてしまい、
+    # リクエストが2つのプロセスに分かれて、計算や AI の会話の途中の状態を見失う）
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        import socket
+
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, app: App, router: Router, *, allowed_hosts: set[str] | None = None, public_hosts: set[str] | None = None):
         from .proxyauth import ProxyAuthVerifier

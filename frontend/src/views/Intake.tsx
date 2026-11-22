@@ -5,41 +5,33 @@ import { post, ApiError } from '../lib/api';
 import { QUICK, RecordForm, fieldsForRecord, fieldsForLedger, recordSummary, recordDate, type FormHandle } from '../lib/forms';
 import { originLabel, enumLabel, conceptLabel } from '../lib/labels.js';
 import { refreshStatus } from '../lib/status';
+import { postChecked } from '../lib/writes';
 import { S, useS, loadMeta, loadRecords, personName, kindMeta, kindTitle, formCtx } from '../lib/store';
 import { useApi } from '../lib/useApi';
 import { Icon } from '../ui/Icon';
 import { Avatar, ErrorNote, ProblemsList, Skeleton } from '../ui/bits';
-import { toast, errorToast, modal, openDrawer } from '../ui/overlay';
+import { toast, errorToast, modal, openDrawer, confirmBox, askText } from '../ui/overlay';
+import { DocList, docFacts, docGivenName, docKindName, docTitle, evStatus, shareDoc, useDocRecords } from './Docs';
+import { isPersonProposal, personProposalLine, reviewPersonProposal } from './personProposal';
+import { isSettingProposal, settingTitle, settingLine, reviewSettingProposal, SettingBody, acceptSettingProposal } from './settingProposal';
 
-const TABS: Array<[string, string]> = [['new', '未登録'], ['pending', '確認待ち'], ['done', '登録済み'], ['ignored', '対象外'], ['all', 'すべて']];
 const enc = encodeURIComponent;
-
-function evStatus(e: any): string {
-  if (e.ignored) return 'ignored';
-  if (e.records.length) return 'done';
-  if (e.pending) return 'pending';
-  return 'new';
-}
 
 function StatusChip({ e }: { e: any }) {
   const s = evStatus(e);
   if (s === 'new') return <span className="chip warn">未登録</span>;
   if (s === 'pending') return <span className="chip unverified">確認待ち</span>;
   if (s === 'done') return <span className="chip ok">登録済み</span>;
-  return <span className="chip oos">対象外</span>;
-}
-
-function ThumbSm({ e }: { e: any }) {
-  const isImg = e.mime.startsWith('image/') && e.mime !== 'image/heic';
-  return <span className="thumb-sm">{isImg ? <img src={`/api/evidence/${e.id}/file`} alt="" loading="lazy" /> : e.ext.toUpperCase()}</span>;
-}
-
-function docName(e: any): string {
-  const q = QUICK.find((x: any) => x.id === e.doc_type);
-  return q ? q.name : (e.label || '未分類');
+  return <span className="chip">参考資料</span>;
 }
 
 /** 語彙（記録の種類）と記録を取り直してから中身を出す（古い画面の loadMeta → loadRecords(true)）。key が変わるたびに取り直す */
+// 記録の ID を画面の言葉に（種類の名前）。一覧にまだなければ「記録」
+function recordName(rid: string): string {
+  const hit = (S.records || []).find((r: any) => (r.record || r).id === rid);
+  return hit ? kindTitle((hit.record || hit).kind) : '記録';
+}
+
 function useFreshRecords(key: string) {
   const meta = useS((s) => s.meta);
   const [done, setDone] = useState<string | null>(null);
@@ -62,18 +54,25 @@ export function UploadPage() {
   return <UploadView key={owner || ''} ev={q.data} ownerArg={owner} />;
 }
 
+// 書類の画面：家族の書類を見返す場所（だれの・何の・いつの、で探す）。追加はいつでも上のボタンから
+const STATUS_FILTERS: Array<[string, string]> = [['', 'すべて'], ['new', '未登録'], ['pending', '確認待ち'], ['ignored', '参考資料']];
+
 function UploadView({ ev, ownerArg }: { ev: any; ownerArg?: string }) {
   const navigate = useNavigate();
   const persons = useS((s) => s.persons);
-  const [owner, setOwner] = useState<string>(() => ownerArg || S.me.person_id);
-  const [docType, setDocType] = useState('');
+  const records = useDocRecords();
+  // 絞り込み：人（道の /upload/<人> で最初から絞れる）・種類・状態・ことば
+  const [who, setWho] = useState<string>(() => (ownerArg && persons.some((x) => x.person_id === ownerArg) ? ownerArg : ''));
+  const [kind, setKind] = useState('');
+  const [status, setStatus] = useState('');
+  const [text, setText] = useState('');
   const [progress, setProgress] = useState('');
   const [over, setOver] = useState(false);
-  const [tab, setTab] = useState<string>(() => (ev.evidence.some((e: any) => evStatus(e) === 'new') ? 'new' : 'all'));
   const fileIn = useRef<HTMLInputElement>(null);
-  // アップロードの途中で選び直しても、そのときの値を使う（古い画面は欄の値をその都度読んでいた）
-  const sel = useRef({ owner, docType });
-  sel.current = { owner, docType };
+  // 追加する書類の持ち主：人で絞っていればその人、いなければ自分（あとで書類の画面で変えられる）
+  const owner = who || S.me.person_id;
+  const sel = useRef({ owner });
+  sel.current = { owner };
 
   async function upload(files: File[]) {
     const ids: string[] = [];
@@ -85,16 +84,16 @@ function UploadView({ ev, ownerArg }: { ev: any; ownerArg?: string }) {
         const buf = await f.arrayBuffer();
         const r = await post(`/api/evidence?owner=${enc(sel.current.owner)}`, undefined, { raw: buf, contentType: f.type || 'application/octet-stream' });
         if (r.duplicate) toast('同じ書類はアップロード済みです');
-        if (sel.current.docType) await post(`/api/evidence/${r.id}/meta`, { doc_type: sel.current.docType });
         ids.push(r.id);
       } catch (e) { errorToast(e); }
     }
     setProgress('');
+    if (fileIn.current) fileIn.current.value = ''; // 同じファイルをもう一度選べるように
     if (ids.length) {
       toast(`${ids.length}件アップロードしました`);
       await refreshStatus();
       if (ids.length === 1) navigate(`/evidence/${ids[0]}`);
-      else setTab('new'); // 一覧は書き込みのあとに自動で取り直される
+      else setStatus('new'); // 一覧は書き込みのあとに自動で取り直される
     }
   }
   const uploadRef = useRef(upload);
@@ -110,21 +109,33 @@ function UploadView({ ev, ownerArg }: { ev: any; ownerArg?: string }) {
     return () => document.removeEventListener('paste', onPaste);
   }, []);
 
-  const list = ev.evidence.filter((e: any) => tab === 'all' || evStatus(e) === tab);
+  const all: any[] = ev.evidence;
+  const ofWho = all.filter((e) => !who || e.owner_person === who);
+  // 種類の絞り込みは、いまある書類の種類だけを出す
+  const kinds = [...new Set(ofWho.map((e) => docKindName(e, records)))].sort((x, y) => (x === '未分類' ? 1 : y === '未分類' ? -1 : x.localeCompare(y, 'ja')));
+  const word = text.trim();
+  const list = ofWho.filter((e) => (!kind || docKindName(e, records) === kind) && (!status || evStatus(e) === status)
+    && (!word || [docTitle(e, records), docKindName(e, records), personName(e.owner_person), docFacts(e, records).date].some((x) => String(x).includes(word))));
+  const todo = ofWho.filter((e) => evStatus(e) === 'new').length;
+  const whoName = who ? personName(who) : '';
   return (
     <>
-      <div className="page-head"><div className="grow"><h1>書類</h1>
-        <p className="lead">給与明細・源泉徴収票・領収書</p></div></div>
-      <div className="toolbar"><Icon name="users" size={16} cls="muted" />
-        <select className="in" style={{ width: '180px' }} value={owner} onChange={(e) => setOwner(e.target.value)}>
-          {persons.map((p) => <option key={p.person_id} value={p.person_id}>{p.display_name}</option>)}
-        </select>
-        <select className="in" style={{ width: '220px' }} value={docType} onChange={(e) => setDocType(e.target.value)}>
-          <option value="">種類：あとで</option>
-          {QUICK.map((q: any) => <option key={q.id} value={q.id}>{q.name}</option>)}
-        </select>
+      <div className="page-head keep"><div className="grow"><h1>書類</h1>
+        <p className="lead hide-sm">給与明細・源泉徴収票・領収書などを、家族ごとにまとめて見返せます</p></div>
+        <button type="button" className="btn primary" onClick={() => fileIn.current?.click()}><Icon name="camera" size={15} />{progress || '追加'}</button></div>
+      <input type="file" multiple accept="image/*,application/pdf" style={{ display: 'none' }} ref={fileIn}
+        onChange={(e) => upload([...(e.currentTarget.files || [])])} />
+
+      <div className="chips-row" role="group" aria-label="人で絞る">
+        <button type="button" className={`pchip ${who === '' ? 'on' : ''}`} onClick={() => { setWho(''); setKind(''); }}><Icon name="users" size={14} />全員</button>
+        {persons.map((x) => (
+          <button type="button" key={x.person_id} className={`pchip ${who === x.person_id ? 'on' : ''}`} onClick={() => { setWho(x.person_id); setKind(''); }}>
+            <Avatar id={x.person_id} name={x.display_name} small />{x.display_name}
+          </button>
+        ))}
       </div>
-      <div className={`dropbar${over ? ' over' : ''}`} tabIndex={0} role="button" aria-label="書類を選ぶ"
+
+      <div className={`dropbar hide-sm${over ? ' over' : ''}`} tabIndex={0} role="button" aria-label="書類を選ぶ"
         onClick={() => fileIn.current?.click()}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileIn.current?.click(); }}
         onDragOver={(e) => { e.preventDefault(); setOver(true); }}
@@ -132,39 +143,44 @@ function UploadView({ ev, ownerArg }: { ev: any; ownerArg?: string }) {
         onDrop={(e) => { e.preventDefault(); setOver(false); upload([...e.dataTransfer.files]); }}>
         <div className="d-ico"><Icon name="upload" size={20} /></div>
         <div className="grow"><b>ここにドラッグ＆ドロップ</b>
-          <span className="muted" style={{ fontSize: '12.5px' }}>写真・PDF</span></div>
+          <span className="muted" style={{ fontSize: '12.5px' }}>{`写真・PDF。${whoName || 'あなた'}の書類として追加します`}</span></div>
         <span className="muted">{progress}</span>
-        <span className="btn primary"><Icon name="camera" size={15} />撮影・アップロード</span>
       </div>
-      <input type="file" multiple accept="image/*,application/pdf" style={{ display: 'none' }} ref={fileIn}
-        onChange={(e) => upload([...(e.currentTarget.files || [])])} />
-      <div className="toolbar" style={{ marginTop: '24px' }}>
-        <div className="seg">
-          {TABS.map(([k, label]) => {
-            const n = k === 'all' ? ev.evidence.length : ev.evidence.filter((e: any) => evStatus(e) === k).length;
-            return <button type="button" key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{label}<span className="count">{String(n)}</span></button>;
-          })}
-        </div>
-      </div>
-      <div>
-        {list.length ? (
-          <div className="table-wrap"><table className="t">
-            <thead><tr><th>書類</th><th>人</th><th>状態</th><th className="hide-sm">記録</th><th className="hide-sm">追加日</th><th className="hide-sm" /></tr></thead>
-            <tbody>
-              {list.map((e: any) => (
-                <tr key={e.id} className="click" onClick={() => navigate(`/evidence/${e.id}`)}>
-                  <td><div className="row" style={{ flexWrap: 'nowrap', gap: '12px' }}><ThumbSm e={e} /><div><div className="cell-main">{docName(e)}</div><div className="cell-sub mono">{`${e.ext.toUpperCase()}・${(e.size / 1024).toFixed(0)} KB`}</div></div></div></td>
-                  <td><div className="row" style={{ flexWrap: 'nowrap' }}><Avatar id={e.owner_person} name={personName(e.owner_person)} small />{personName(e.owner_person)}</div></td>
-                  <td><StatusChip e={e} /></td>
-                  <td className="muted hide-sm">{e.records.length ? `${e.records.length} 件` : '—'}</td>
-                  <td className="muted hide-sm">{(e.uploaded_at || '').slice(0, 10)}</td>
-                  <td className="num hide-sm"><Icon name="chevronRight" size={16} cls="muted" /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table></div>
-        ) : <div className="card empty"><Icon name="inbox" size={28} /><b>{tab === 'new' ? '未登録の書類はありません' : '書類はありません'}</b></div>}
-      </div>
+
+      {todo ? (
+        <button type="button" className="band doc-todo" onClick={() => setStatus(status === 'new' ? '' : 'new')}>
+          <Icon name="inbox" size={17} /><span>{`未登録の書類 ${todo}件`}</span><small>{status === 'new' ? '絞り込みを解除' : '種類を選んで登録する'}</small><Icon name="chevronRight" size={15} />
+        </button>
+      ) : null}
+
+      {all.length ? (
+        <>
+          <input type="search" className="in doc-search" placeholder="種類・名前・日付で探す" value={text} onChange={(e) => setText(e.target.value)} />
+          {kinds.length > 1 ? (
+            <div className="chips-row" role="group" aria-label="種類で絞る">
+              <button type="button" className={`pchip ${kind === '' ? 'on' : ''}`} onClick={() => setKind('')}>すべての種類</button>
+              {kinds.map((k) => <button type="button" key={k} className={`pchip ${kind === k ? 'on' : ''}`} onClick={() => setKind(kind === k ? '' : k)}>{k}</button>)}
+            </div>
+          ) : null}
+          <div className="chips-row doc-status" role="group" aria-label="状態で絞る">
+            {STATUS_FILTERS.map(([k, label]) => {
+              const n = k ? ofWho.filter((e) => evStatus(e) === k).length : ofWho.length;
+              if (k && !n) return null;
+              return <button type="button" key={k} className={`pchip small ${status === k ? 'on' : ''}`} onClick={() => setStatus(k)}>{label}<span className="count">{String(n)}</span></button>;
+            })}
+          </div>
+        </>
+      ) : null}
+
+      {list.length ? <DocList items={list} records={records} showOwner={!who} />
+        : (
+          <div className="card empty"><Icon name="inbox" size={28} />
+            <b>{all.length ? '当てはまる書類がありません' : 'まだ書類がありません'}</b>
+            {all.length ? null : <div className="muted">給与明細や源泉徴収票を撮って入れておくと、あとで家族で見返せます</div>}
+            <button type="button" className="btn primary" style={{ marginTop: '10px' }} onClick={() => fileIn.current?.click()}><Icon name="camera" size={15} />書類を追加</button>
+          </div>
+        )}
+      {ev.hidden ? <p className="muted" style={{ fontSize: '12.5px', marginTop: '10px' }}>{`ほかに、本人が見せていない書類が${ev.hidden}件あります`}</p> : null}
     </>
   );
 }
@@ -261,8 +277,8 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
     value.kind = km.kind;
     setErr(null);
     try {
-      if (proposal) await post(`/api/proposals/${proposal.id}/accept`, { record: value });
-      else await post('/api/records', { section: km.section, record: value, evidence_ids: [eid] });
+      if (proposal) await postChecked(`/api/proposals/${proposal.id}/accept`, { record: value });
+      else await postChecked('/api/records', { section: km.section, record: value, evidence_ids: [eid] });
       toast('登録しました');
       await refreshStatus();
       const again = await modal('登録しました', <p className="muted">同じ書類から続けて登録できます</p>, [
@@ -316,7 +332,7 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
     const was = e.ignored;
     try {
       await post(`/api/evidence/${enc(eid)}/meta`, { ignored: !was });
-      toast(was ? '戻しました' : '対象外にしました');
+      toast(was ? '戻しました' : '参考資料にしました');
       await refreshStatus();
       await reset();
     } catch (e2) { errorToast(e2); }
@@ -336,6 +352,12 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
     if (kind) openForm({ kind, name: kindTitle(kind), icon: 'layers', main: null }, null);
   }
 
+  async function rename() {
+    const v = await askText('書類の名前', '何の書類か、あとで見て分かる名前', { placeholder: '例：2026年10月分の給与明細', required: false, initial: docGivenName(e) });
+    if (v === null) return;
+    try { await post(`/api/evidence/${enc(eid)}/meta`, { label: v || null }); toast(v ? '名前を付けました' : '名前を消しました'); } catch (err) { errorToast(err); }
+  }
+
   async function chooseKind(q: any) {
     setOnKind(q.id);
     openForm(q, null);
@@ -344,13 +366,18 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
 
   return (
     <>
-      <div className="toolbar">
+      <div className="toolbar ev-bar">
         <Link className="btn ghost small" to="/upload"><Icon name="chevronLeft" size={14} />書類</Link>
         <div className="grow" />
-        <button type="button" className="btn small" onClick={() => aiRead(false)}><Icon name="sparkles" size={14} />AI読み取り</button>
-        <button type="button" className="btn small" onClick={toggleIgnored}>{e.ignored ? '対象外を解除' : '対象外にする'}</button>
-        <button type="button" className="btn small icon" disabled={!prev} title="前の書類" onClick={() => prev && navigate(`/evidence/${prev.id}`)}><Icon name="chevronLeft" size={15} /></button>
-        <button type="button" className="btn small icon" disabled={!next} title="次の書類" onClick={() => next && navigate(`/evidence/${next.id}`)}><Icon name="chevronRight" size={15} /></button>
+        <div className="ev-actions">
+          <button type="button" className="btn small" onClick={() => aiRead(false)}><Icon name="sparkles" size={14} />AI読み取り</button>
+          <button type="button" className="btn small" onClick={toggleIgnored}>{e.ignored ? '登録する書類に戻す' : '参考資料にする'}</button>
+        </div>
+        {/* 前後の書類へ：2つを離さない */}
+        <div className="ev-pager">
+          <button type="button" className="btn small icon" disabled={!prev} title="前の書類" aria-label="前の書類" onClick={() => prev && navigate(`/evidence/${prev.id}`)}><Icon name="chevronLeft" size={15} /></button>
+          <button type="button" className="btn small icon" disabled={!next} title="次の書類" aria-label="次の書類" onClick={() => next && navigate(`/evidence/${next.id}`)}><Icon name="chevronRight" size={15} /></button>
+        </div>
       </div>
       <div className="split">
         <div className="pane-left">
@@ -359,7 +386,9 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
             <button type="button" className="btn small icon" title="縮小" onClick={() => setZoom((z) => Math.max(0.3, z / 1.25))}><Icon name="zoomOut" size={15} /></button>
             <button type="button" className="btn small icon" title="回転" onClick={() => setRot((r) => (r + 90) % 360)}><Icon name="rotate" size={15} /></button>
             <div style={{ flex: 1 }} />
-            <a className="btn small" href={fileUrl} target="_blank" rel="noopener"><Icon name="external" size={14} />別のタブ</a>
+            <a className="btn small" href={fileUrl} target="_blank" rel="noopener"><Icon name="external" size={14} /><span className="hide-sm">別のタブ</span></a>
+            <a className="btn small" href={fileUrl} download={e.label || true}><Icon name="download" size={14} />ダウンロード</a>
+            <button type="button" className="btn small" onClick={() => shareDoc(e)}><Icon name="send" size={14} />共有</button>
           </div>
           <div className="viewer">
             {isImg ? <img src={fileUrl} alt="書類の画像" style={zoom !== 1 || rot !== 0 ? { transform: `scale(${zoom}) rotate(${rot}deg)` } : undefined} />
@@ -369,14 +398,19 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
         </div>
         <div className="pane-right">
           <div className="pane-body">
+            {/* 何の書類か（見返すときの見出し）。ファイル名は出さない。名前は付け直せる */}
+            <div className="row between" style={{ marginBottom: '10px', gap: '8px' }}>
+              <b style={{ fontSize: '16px', overflowWrap: 'anywhere' }}>{docTitle(e, S.records)}</b>
+              <button type="button" className="btn small" onClick={rename}><Icon name="edit" size={14} />{docGivenName(e) ? '名前を変える' : '名前を付ける'}</button>
+            </div>
             <div className="row between">
-              <div className="row"><StatusChip e={e} />{e.intact ? <span className="chip ok" title={`sha256 ${e.sha256}`}><Icon name="shield" size={12} />原本</span> : <span className="chip bad">原本が変更されています</span>}</div>
+              <div className="row"><StatusChip e={e} />{e.intact ? <span className="chip ok" title={`sha256 ${e.sha256}`}><Icon name="shield" size={12} />保存時のまま</span> : <span className="chip bad">保存したあとにファイルが変わっています</span>}</div>
               <div className="row"><Icon name="users" size={15} cls="muted" />
                 <select className="in" style={{ width: 'auto', height: '30px' }} value={owner} onChange={(ev) => changeOwner(ev.target.value)}>
                   {persons.map((p) => <option key={p.person_id} value={p.person_id}>{p.display_name}</option>)}
                 </select></div>
             </div>
-            {e.records.length ? <div className="note ok" style={{ marginTop: '12px' }}><Icon name="checkCircle" size={16} /><div>登録済み：{e.records.map((rid: string) => <Link key={rid} to={`/records/${enc(rid)}`} style={{ marginRight: '8px' }}>{rid}</Link>)}</div></div> : null}
+            {e.records.length ? <div className="note ok" style={{ marginTop: '12px' }}><Icon name="checkCircle" size={16} /><div>登録済み：{e.records.map((rid: string) => <Link key={rid} to={`/records/${enc(rid)}`} style={{ marginRight: '8px' }}>{recordName(rid)}</Link>)}</div></div> : null}
             {mine.length ? <div className="note warn" style={{ marginTop: '12px' }}><Icon name="eye" size={16} />{`確認待ち ${mine.length}件`}</div> : null}
             <div className="section-title">種類</div>
             <div className="kinds" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}>
@@ -407,7 +441,7 @@ function EvidenceView({ eid, e, mine, all, reset }: { eid: string; e: any; mine:
                 <div style={{ flex: 1 }} />
                 {cur.proposal ? <button type="button" className="btn ghost danger" onClick={rejectProposal}>却下</button> : null}
               </>
-            ) : <span className="muted" style={{ fontSize: '12.5px' }}>種類を選んでください</span>}
+            ) : e.records.length ? null : <span className="muted" style={{ fontSize: '12.5px' }}>種類を選んでください</span>}
           </div>
         </div>
       </div>
@@ -430,7 +464,7 @@ function PerCandidateTable({ c }: { c: any }) {
 }
 
 const INBOX_TABS: Array<[string, string]> = [['pending', '確認待ち'], ['accepted', '登録済み'], ['rejected', '却下']];
-const PROPOSAL_KIND: Record<string, string> = { record: '記録', judgment: '回答', choice: '回答', forecast: '見込み' };
+const PROPOSAL_KIND: Record<string, string> = { record: '記録', judgment: '回答', choice: '回答', forecast: '見込み', person: '家族', delete: '取消し', correct: '訂正', injection: '設定' };
 
 /** 提案の確認（ドロワーの中身）。登録するのは人 */
 function ProposalForm({ p, km, close }: { p: any; km: any; close: () => void }) {
@@ -452,7 +486,7 @@ function ProposalForm({ p, km, close }: { p: any; km: any; close: () => void }) 
     if (km.mark) value.mark = km.mark;
     setBusy(true);
     try {
-      await post(`/api/proposals/${p.id}/accept`, { record: value, basis_note: note || undefined });
+      await postChecked(`/api/proposals/${p.id}/accept`, { record: value, basis_note: note || undefined });
       toast('登録しました');
       close();
       await refreshStatus(); // 一覧は書き込みのあとに自動で取り直される
@@ -471,10 +505,19 @@ function ProposalForm({ p, km, close }: { p: any; km: any; close: () => void }) 
 }
 
 function openProposal(p: any) {
+  if (isSettingProposal(p)) { reviewSettingProposal(p).then((ok) => { if (ok) toast('設定しました'); }, errorToast); return; }
+  if (isPersonProposal(p)) { reviewPersonProposal(p).then((ok) => { if (ok) toast('登録しました'); }, errorToast); return; }
   const rec = p.payload.record || {};
   const km = kindMeta(rec.kind);
   if (!km) { toast('この種類は使えません', 'bad'); return; }
-  openDrawer(km.title, (close) => <ProposalForm p={p} km={km} close={() => close()} />);
+  if (p.kind === 'delete') {
+    // 取消しの提案：中身を確かめて、人が押したときだけ取り消す（消さずに、取消しと理由を追記する）
+    confirmBox(`${km.title}を取り消しますか`, [recordDate(rec), recordSummary(rec), p.rationale].filter(Boolean).join('　'), '取り消す', 'danger')
+      .then(async (ok) => { if (!ok) return; await post(`/api/proposals/${p.id}/accept`, {}); toast('取り消しました'); await loadRecords(true); await refreshStatus(); })
+      .catch(errorToast);
+    return;
+  }
+  openDrawer(p.kind === 'correct' ? `訂正：${km.title}` : km.title, (close) => <ProposalForm p={p} km={km} close={() => close()} />);
 }
 
 function ProposalCard({ p, st }: { p: any; st: string }) {
@@ -484,21 +527,31 @@ function ProposalCard({ p, st }: { p: any; st: string }) {
   const reject = async () => {
     try { await post(`/api/proposals/${p.id}/reject`, { note: '人が捨てた' }); toast('却下しました'); await refreshStatus(); } catch (e) { errorToast(e); }
   };
+  const [busy, setBusy] = useState(false);
+  const setting = isSettingProposal(p);
+  // 設定の提案は、値と出典をカードにそのまま出す（開かないと値が分からない、をなくす）。押すとそのまま設定する
+  const acceptSetting = async () => {
+    setBusy(true);
+    try { await acceptSettingProposal(p); toast('設定しました'); } catch (e) { errorToast(e); } finally { setBusy(false); }
+  };
   return (
     <div className="card">
-      <div className="row">
+      <div className="row" style={{ flexWrap: 'wrap', gap: '6px' }}>
         <span className="chip unverified">{originLabel(p.origin)}</span>
-        <span className="chip">{PROPOSAL_KIND[p.kind] || p.kind}</span>
-        <b style={{ flex: 1 }}>{kindTitle(rec.kind)}</b>
-        <span className="muted">{(p.created_at || '').slice(0, 16).replace('T', ' ')}</span>
+        <span className="chip">{PROPOSAL_KIND[p.kind] || '提案'}</span>
+        <span style={{ flex: 1 }} />
+        <span className="muted" style={{ fontSize: '12.5px' }}>{(p.created_at || '').slice(0, 16).replace('T', ' ')}</span>
       </div>
-      <div className="muted" style={{ marginTop: '4px' }}>{who.map(personName).join('・')} {recordDate(rec)} {recordSummary(rec)}</div>
+      <b style={{ display: 'block', marginTop: '8px', overflowWrap: 'anywhere' }}>{isSettingProposal(p) ? settingTitle(p) : isPersonProposal(p) ? '家族を追加' : kindTitle(rec.kind)}</b>
+      <div className="muted" style={{ marginTop: '4px' }}>{isSettingProposal(p) ? settingLine(p) : isPersonProposal(p) ? personProposalLine(p) : <>{who.map(personName).join('・')} {recordDate(rec)} {recordSummary(rec)}</>}</div>
       {p.rationale ? <div className="muted" style={{ marginTop: '6px' }}>{p.rationale}</div> : null}
       <PerCandidateTable c={p.candidates} />
       {p.evidence_id ? <Link to={`/evidence/${p.evidence_id}`} className="btn small" style={{ marginTop: '8px' }}><Icon name="receipt" size={14} />書類を表示</Link> : null}
+      {setting ? <div className="inbox-setting"><SettingBody pr={p} /></div> : null}
       {st === 'pending' ? (
-        <div className="row" style={{ marginTop: '8px' }}>
-          <button type="button" className="btn primary" onClick={() => openProposal(p)}>確認</button>
+        <div className="row" style={{ marginTop: '10px' }}>
+          {setting ? <button type="button" className="btn primary" disabled={busy} onClick={acceptSetting}><Icon name="check" size={15} />{busy ? '設定中…' : '設定する'}</button>
+            : <button type="button" className="btn primary" onClick={() => openProposal(p)}>確認</button>}
           <button type="button" className="btn danger" onClick={reject}>却下</button>
         </div>
       ) : (

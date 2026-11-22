@@ -1,9 +1,9 @@
 // 設定（共有の範囲・メンバー・AI・エージェント連携・市町村と保険者の値・計算の問い・版・操作の記録）
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import { Fragment, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { get, post, ApiError } from '../lib/api';
 import { FieldWidget } from '../lib/forms';
-import { enumLabel, prettyValue } from '../lib/labels.js';
+import { enumLabel } from '../lib/labels.js';
 import { CLIENTS as CLIENTS_RAW } from '../lib/mcp_clients.js';
 import { passkeyAvailable, registerPasskey } from '../lib/passkey.js';
 import { refreshStatus } from '../lib/status';
@@ -14,6 +14,7 @@ import { Loaded, ErrorNote, Skeleton, ProblemsList, copyText } from '../ui/bits'
 import { toast, errorToast, modal, confirmBox } from '../ui/overlay';
 import { CategorySettings } from './Book';
 import { openInvite } from './Results';
+import { settingFieldLabel, settingValueText } from './settingProposal';
 
 const CLIENTS: any[] = CLIENTS_RAW;
 
@@ -172,8 +173,13 @@ function Consents() {
         </div>
       )) : <div className="empty">設定できる人がいません</div>}</div>
       <h2>変更履歴</h2>
-      <div className="table-wrap"><table className="t"><thead><tr><th>日時</th><th>人</th><th>種類</th><th>値</th><th>変更した人</th></tr></thead>
-        <tbody>{c.history.map((x: any, i: number) => <tr key={i}><td>{x.decided_at.replace('T', ' ')}</td><td>{x.person || '—'}</td><td>{CONSENT_LABEL[x.kind] || '共有'}</td><td>{x.value ? '共有する' : 'しない'}</td><td>{x.decided_by}</td></tr>)}</tbody></table></div>
+      {/* 1行ずつの並び（表だとスマホで列がつぶれる）：だれの・何を・どうしたか、いつ・だれが変えたか */}
+      <div className="card flush hist-list">{c.history.length ? c.history.map((x: any, i: number) => (
+        <div className="hist-row" key={i}>
+          <div><b>{x.person || '—'}</b>{` の ${CONSENT_LABEL[x.kind] || '共有'}`}<span className={`chip ${x.value ? 'ok' : ''}`} style={{ marginLeft: '8px' }}>{x.value ? '共有する' : 'しない'}</span></div>
+          <div className="muted">{`${String(x.decided_at).slice(0, 16).replace('T', ' ')}・変更した人 ${x.decided_by}`}</div>
+        </div>
+      )) : <div className="empty">まだ変更はありません</div>}</div>
     </>
   );
 }
@@ -457,6 +463,10 @@ function DataField({ f, init, ref }: { f: any; init?: any; ref?: Ref<Reader> }) 
 function InjectionForm({ p, meta, isAdmin, issuerKindArg, issuerCodeArg, onSaved }: { p: any; meta: any; isAdmin: boolean; issuerKindArg?: string; issuerCodeArg?: string; onSaved: () => void }) {
   const [ik, setIk] = useState<string>(() => (p.issuer_kinds.includes(issuerKindArg) ? issuerKindArg : p.issuer_kinds[0]) ?? '');
   const [code, setCode] = useState(issuerCodeArg || '');
+  // 市区町村・都道府県は、コードを打たずに総務省の一覧から選ぶ（打ち間違い・区のコードを防ぐ。サーバーも一覧で確かめる）
+  const muni = useRef<Reader | null>(null);
+  const [prefs, setPrefs] = useState<string[][]>([]);
+  useEffect(() => { import('../lib/municipalities.js').then((m) => setPrefs((m.PREFECTURES || []) as string[][])); }, []);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [url, setUrl] = useState('');
@@ -467,9 +477,14 @@ function InjectionForm({ p, meta, isAdmin, issuerKindArg, issuerCodeArg, onSaved
   const fields = useRef<Array<Reader | null>>([]);
   const save = async () => {
     const data: Record<string, any> = {};
+    let issuerCode = code.trim();
+    if (ik === 'municipality') {
+      try { issuerCode = muni.current ? (muni.current.read() || '') : ''; } catch (e: any) { toast(`市区町村：${e.message}`, 'bad'); return; }
+    }
+    if (!issuerCode) { toast(ik === 'municipality' ? '市区町村を選んでください' : ik === 'prefecture' ? '都道府県を選んでください' : '番号を入れてください', 'bad'); return; }
     try { p.fields.forEach((f: any, i: number) => { const v = fields.current[i]!.read(); if (v !== undefined) data[f.name] = v; }); } catch (e: any) { toast(e.message, 'bad'); return; }
     try {
-      await post('/api/injections', { point: p.name, issuer: { kind: ik, code }, applies: { from_on: from, ...(to ? { to_on: to } : {}) }, source: { url, retrieved_on: got, source_kind: kind, ...(title ? { title } : {}) }, data });
+      await post('/api/injections', { point: p.name, issuer: { kind: ik, code: issuerCode }, applies: { from_on: from, ...(to ? { to_on: to } : {}) }, source: { url, retrieved_on: got, source_kind: kind, ...(title ? { title } : {}) }, data });
       toast('保存しました');
       await refreshStatus();
       onSaved();
@@ -480,8 +495,19 @@ function InjectionForm({ p, meta, isAdmin, issuerKindArg, issuerCodeArg, onSaved
       <h3>{p.title}</h3><div className="muted" />
       {p.candidates.length ? <div className="note">{`未設定のときは ${p.candidates.map((c: any) => c.label).join('・')} のすべてで計算します`}</div> : <div className="note warn">設定するまで、関係する金額は未確定になります</div>}
       {p.note ? <div className="muted">{p.note}</div> : null}
-      <div className="form-cols"><div className="field"><label>区分</label><select className="in" value={ik} onChange={(e) => setIk(e.target.value)}>{p.issuer_kinds.map((k: string) => <option key={k} value={k}>{enumLabel(k)}</option>)}</select></div>
-        <div className="field"><label>コード</label><input type="text" className="in" placeholder="市区町村コード（6桁）・保険者番号" value={code} onChange={(e) => setCode(e.target.value)} /></div>
+      <div className="form-cols"><div className="field"><label>区分</label><select className="in" value={ik} onChange={(e) => { setIk(e.target.value); setCode(''); }}>{p.issuer_kinds.map((k: string) => <option key={k} value={k}>{enumLabel(k)}</option>)}</select></div>
+        {ik === 'municipality' ? (
+          <div className="field"><label>市区町村</label>
+            <FieldWidget key="muni" ref={muni} schema={{ $ref: '#/$defs/municipality_code' }} initial={issuerKindArg === 'municipality' ? issuerCodeArg : undefined} ctx={formCtx()} /></div>
+        ) : ik === 'prefecture' ? (
+          <div className="field"><label>都道府県</label>
+            <select className="in" value={code} onChange={(e) => setCode(e.target.value)}>
+              <option value="">（選ぶ）</option>
+              {prefs.map((r) => <option key={r[0]} value={r[0]}>{r[1]}</option>)}
+            </select></div>
+        ) : (
+          <div className="field"><label>保険者番号</label><input type="text" className="in" placeholder="保険証に書いてある番号" value={code} onChange={(e) => setCode(e.target.value)} /></div>
+        )}
         <div className="field"><label>開始日</label><input type="date" className="in" value={from} onChange={(e) => setFrom(e.target.value)} /></div>
         <div className="field"><label>終了日（任意）</label><input type="date" className="in" value={to} onChange={(e) => setTo(e.target.value)} /></div></div>
       <h3>値</h3><div className="form-cols">{p.fields.map((f: any, i: number) => <DataField key={f.name} f={f} ref={(r) => { fields.current[i] = r; }} />)}</div>
@@ -518,16 +544,29 @@ function Injections({ pointArg, issuerKindArg, issuerCodeArg }: { pointArg?: str
     <>
       <div className="note">お住まいの市区町村や加入している保険で変わる値を、出典つきで設定します</div>
       <h2>設定済み</h2>
-      <div className="table-wrap"><table className="t"><thead><tr><th>項目</th><th>市区町村・保険者</th><th>適用</th><th>出典</th><th>値</th><th /></tr></thead>
-        <tbody>{r.injections.length ? r.injections.map((x: any) => {
-          const e = x.entry;
-          return (
-            <tr key={x.id} style={x.retired_at ? { opacity: 0.5 } : undefined}><td>{e.point}</td><td>{`${enumLabel(e.issuer.kind)} ${e.issuer.code}`}</td><td>{`${e.applies.from_on}〜${e.applies.to_on || ''}`}</td>
-              <td><a href={e.source.url} target="_blank" rel="noopener noreferrer">{e.source.title || e.source.url}</a><div className="muted">{`${e.source.source_kind}・取得 ${e.source.retrieved_on}`}</div></td>
-              <td>{prettyValue(e.data)}</td>
-              <td>{x.retired_at ? '解除済み' : isAdmin ? <button type="button" className="btn small danger" onClick={() => retire(x)}>解除</button> : null}</td></tr>
-          );
-        }) : <tr><td colSpan={6} className="empty">ありません</td></tr>}</tbody></table></div>
+      {/* 1件ずつのカード（表だとスマホで列がつぶれる） */}
+      <div className="stack">{r.injections.length ? r.injections.map((x: any) => {
+        const e = x.entry;
+        const pt = points.find((y) => y.name === e.point);
+        const [inst, short] = String(e.point).includes('.') ? [String(e.point).split('.')[0], String(e.point).split('.').slice(1).join('.')] : ['', String(e.point)];
+        const fieldOf: Record<string, any> = Object.fromEntries(((pt && pt.fields) || []).map((f: any) => [f.name, f]));
+        const safe = typeof e.source.url === 'string' && /^https?:\/\//i.test(e.source.url);
+        return (
+          <div className="card inj-card" key={x.id} style={x.retired_at ? { opacity: 0.55 } : undefined}>
+            <div className="row between" style={{ gap: '8px', alignItems: 'flex-start' }}>
+              <div><b>{short}</b>{inst ? <span className="chip" style={{ marginLeft: '6px' }}>{inst}</span> : null}</div>
+              {x.retired_at ? <span className="chip">解除済み</span> : isAdmin ? <button type="button" className="btn small danger" onClick={() => retire(x)}>解除</button> : null}
+            </div>
+            <dl className="inj-kv">
+              <dt>市区町村・保険者</dt><dd>{x.issuer_label || `${enumLabel(e.issuer.kind)} ${e.issuer.code}`}</dd>
+              <dt>適用</dt><dd>{`${e.applies.from_on}〜${e.applies.to_on || ''}`}</dd>
+              {Object.entries(e.data || {}).map(([k, v]) => <Fragment key={k}><dt>{settingFieldLabel(fieldOf[k], k)}</dt><dd>{settingValueText(v, fieldOf[k] && fieldOf[k].kind)}</dd></Fragment>)}
+              <dt>出典</dt><dd>{safe ? <a href={e.source.url} target="_blank" rel="noopener noreferrer">{e.source.title || e.source.url}</a> : (e.source.title || '')}
+                <div className="muted" style={{ fontSize: '12px' }}>{`${e.source.source_kind}・取得 ${e.source.retrieved_on}`}</div></dd>
+            </dl>
+          </div>
+        );
+      }) : <div className="card empty">ありません</div>}</div>
       <h2>追加</h2>
       <select className="in" value={sel} onChange={(e) => setChosen(e.target.value)}><option value="">項目を選択</option>
         {[...new Set(points.map((x) => x.institution))].map((inst) => <optgroup key={inst} label={inst}>{points.filter((x) => x.institution === inst).map((x) => <option key={x.name} value={x.name}>{`${x.name}`}</option>)}</optgroup>)}</select>

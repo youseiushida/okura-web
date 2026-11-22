@@ -118,6 +118,18 @@ def handle(client: Client, msg: dict[str, Any]) -> None:
     elif method == "tools/call":
         name = params.get("name", "")
         args = params.get("arguments") or {}
+        if name == "add_document" and args.get("path") and not args.get("content_base64"):
+            # このパソコンのファイルを読んで送る（stdio の接続だけ。エージェントが base64 を書かなくて済む）
+            import base64
+
+            try:
+                with open(str(args["path"]), "rb") as f:
+                    data = f.read(26 * 2**20)
+            except OSError:
+                _result(mid, {"content": [{"type": "text", "text": "ファイルを開けない"}], "isError": True})
+                return
+            args = {**{k: v for k, v in args.items() if k != "path"}, "content_base64": base64.b64encode(data).decode("ascii")}
+            args.setdefault("filename", os.path.basename(str(params["arguments"]["path"])))
         out = client.call(name, args)
         if out.get("ok"):
             _result(mid, {"content": [{"type": "text", "text": json.dumps(out.get("result"), ensure_ascii=False)}], "isError": False})

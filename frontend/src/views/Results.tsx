@@ -1,4 +1,5 @@
 // 決めること（一問ずつの面接）・結果と根拠・申告書に写す
+import { PersonDocs } from './Docs';
 import { createRef, Fragment, useEffect, useState, type ReactNode, type RefObject } from 'react';
 import { Link, useParams } from 'react-router';
 import { get, post, ApiError } from '../lib/api';
@@ -537,11 +538,14 @@ export function PersonPage() {
     <div className="person-hero"><Avatar id={pid} name={person.display_name} />
       <div><h1>{person.display_name}</h1><div className="muted">{[age !== null ? `${age}歳` : '', person.is_me ? 'あなた' : ''].filter(Boolean).join('・')}</div></div></div>
   );
+  // その人の書類（見返す入口）と、家族の情報への入口
   const links = (
-    <div className="row" style={{ gap: '8px', flexWrap: 'wrap', margin: '4px 0 16px' }}>
-      <Link className="btn" to="/upload"><Icon name="camera" size={15} />書類</Link>
-      <Link className="btn" to="/family"><Icon name="users" size={15} />家族の情報</Link>
-    </div>
+    <>
+      <div className="row" style={{ gap: '8px', flexWrap: 'wrap', margin: '4px 0 16px' }}>
+        <Link className="btn" to="/family"><Icon name="users" size={15} />家族の情報</Link>
+      </div>
+      <PersonDocs pid={pid} />
+    </>
   );
   if (!d) return <>{head}{links}<div className="card empty"><b>まだ計算していません</b></div></>;
   if (!d.persons.includes(pid)) return <>{head}{links}<div className="card empty"><Icon name="lock" size={26} /><b>非公開</b><div className="muted">本人が数字の共有をしていません</div></div></>;

@@ -15,8 +15,9 @@
 
 | 部品 | 出す道具 | 中身 |
 |---|---|---|
-| 登録の確認（1件） | `propose_record`・`propose_judgment`・`propose_forecast`・`propose_records`（1件） | 記録の種類・日本語の欄と値・原本へのリンク・AI の説明。［登録］［直す］［やめる］ |
+| 登録の確認（1件） | `propose_record`・`propose_judgment`・`propose_forecast`・`propose_person`（家族の追加：名前と生年月日）・`propose_change`（記録の取消し・訂正。押すと追記される）・`propose_records`（1件） | 記録の種類・日本語の欄と値・原本へのリンク・AI の説明。［登録］［直す］［やめる］ |
 | まとめて登録 | `propose_records`（2件以上） | 行ごとのチェック。行を押すと中身を見て直せる。［○件を登録］ |
+| 画面への入口 | `show_screen` | 行き先は決まった一覧からだけ（AI は URL を作らない）。押すとその画面に移る |
 | 質問 | `ask_user` | 質問と選択肢のボタン。押すと答えが次のメッセージになる（AI はそこで返事を止める） |
 | 家計簿 | `propose_book_entries` | 家計簿の登録待ちに入れた件数。［登録待ちを開く］ |
 
